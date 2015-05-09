@@ -1,6 +1,10 @@
 package robot;
 
+import java.io.IOException;
+import java.math.BigInteger;
 import java.net.*;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 
 /**
  * @author klimesf
@@ -12,55 +16,86 @@ public class Robot {
 
     public static void main(String[] args) throws Exception {
         DatagramSocket socket;
-        DatagramPacket packet;
-        InetAddress address, fromAddress;
+        InetAddress address;
         int fromPort = Robot.PORT_FROM, portTo = Robot.PORT_TO;
         socket = new DatagramSocket(fromPort);
         address = InetAddress.getByName(args[0]);
 
         System.out.printf("Connecting to server %s:%s\n", args[0], portTo);
 
+        PhotoReciever.recievePhoto(socket, address, portTo);
+
+        if (!socket.isClosed()) {
+            socket.close();
+        }
+    }
+}
+
+class Helpers {
+    public static Integer byteArrayToInt(byte[] bytes) {
+        return new BigInteger(bytes).intValue();
+    }
+
+    public static byte[] intToByteArray(int value) {
+        ByteBuffer dbuf = ByteBuffer.allocate(4);
+        dbuf.putInt(value);
+        return dbuf.array();
+    }
+}
+
+class PhotoReciever {
+
+    public static void recievePhoto(DatagramSocket socket, InetAddress address, Integer port) throws IOException, CorruptedPacketException {
+        DatagramPacket packet;
+        ConnectionId connectionId;
+        KarelPacket karelPacket;
+
         //
-        // Send photo request
+        // Init connection
         //
-        packet = KarelPacket.createOpeningPacket(PacketData.createPhotoCommand()).createDatagramPacket(address, portTo);
+        karelPacket = KarelPacket.createOpeningPacket(PacketData.createPhotoCommand());
+        packet = karelPacket.createDatagramPacket(address, port);
         socket.send(packet);
-
-        StringBuilder sb = new StringBuilder(packet.getLength());
-        for (byte b : packet.getData()) {
-            sb.append(String.format("%d ", b));
-        }
-        System.out.println("Sent packet: " + sb.toString() + " to: " + packet.getAddress() + ":" + packet.getPort());
+        System.out.println("SEND: " + karelPacket.toString());
 
         //
-        // Receive reply and print
+        // Receive reply with connection id
         //
-        System.out.println("Waiting for reply");
-        packet = new DatagramPacket(packet.getData(), packet.getLength());
+        packet = new DatagramPacket(new byte[255 + 9], 255 + 9);
         socket.receive(packet);
-        KarelPacket recievedPacket = KarelPacket.parseFromDatagramPacket(packet);
-        fromAddress = packet.getAddress();
-        fromPort = packet.getPort();
-        sb = new StringBuilder(packet.getLength());
-        for (byte b : packet.getData()) {
-            sb.append(String.format("%d ", b));
-        }
-        System.out.println("Received: " + sb.toString() + "   from: "
-                + fromAddress + ":" + fromPort);
+        karelPacket = KarelPacket.parseFromDatagramPacket(packet);
+        System.out.println("RECV: " + karelPacket.toString());
+        connectionId = karelPacket.getId();
 
-        sb = new StringBuilder(packet.getLength());
-        for (byte b :recievedPacket.getId().getBytes()) {
-            sb.append(String.format("%d ", b));
-        }
-        System.out.println("Connection id: " + sb.toString());
+        while (!socket.isClosed()) {
+            //
+            // Receive reply with data
+            //
+            packet = new DatagramPacket(new byte[255 + 9], 255 + 9);
+            socket.receive(packet);
+            karelPacket = KarelPacket.parseFromDatagramPacket(packet);
+            System.out.println("RECV: " + karelPacket.toString());
 
-        socket.close();
+            //
+            // Reply with acknowledge
+            //
+            if (karelPacket.getId().equals(connectionId)) {
+                karelPacket = KarelPacket.createAcknowledgePacket(connectionId, karelPacket.getSq(), karelPacket.getFlag(), karelPacket.getData());
+                packet = karelPacket.createDatagramPacket(address, port);
+                socket.send(packet);
+                System.out.println("SEND: " + karelPacket.toString());
+
+                if (karelPacket.getFlag().isClosing()) {
+                    break;
+                }
+            }
+        }
     }
 }
 
 
 // *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *
-// *** PACKETS *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *
+// --- PACKETS --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- -
 // *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *
 
 
@@ -75,6 +110,15 @@ abstract class TwoByteNumber {
 
     public byte[] getBytes() {
         return bytes;
+    }
+
+    @Override
+    public String toString() {
+        return Helpers.byteArrayToInt(bytes).toString();
+    }
+
+    public Integer toInteger() {
+        return Helpers.byteArrayToInt(bytes);
     }
 }
 
@@ -101,6 +145,28 @@ class ConnectionId {
     public static ConnectionId parseFromDatagramPacket(DatagramPacket packet) {
         return new ConnectionId(packet.getData()[0], packet.getData()[1], packet.getData()[2], packet.getData()[3]);
     }
+
+    @Override
+    public boolean equals(Object obj) {
+        if (obj instanceof ConnectionId) {
+            ConnectionId other = (ConnectionId) obj;
+            return other.getBytes()[0] == bytes[0] &&
+                    other.getBytes()[1] == bytes[1] &&
+                    other.getBytes()[2] == bytes[2] &&
+                    other.getBytes()[3] == bytes[3];
+        } else {
+            return false;
+        }
+    }
+
+    @Override
+    public String toString() {
+        StringBuilder sb = new StringBuilder(bytes.length);
+        for (byte b : bytes) {
+            sb.append(String.format("%01X", b));
+        }
+        return sb.toString();
+    }
 }
 
 class SequenceNumber extends TwoByteNumber {
@@ -109,7 +175,7 @@ class SequenceNumber extends TwoByteNumber {
     }
 
     public static SequenceNumber parseFromDatagramPacket(DatagramPacket packet) {
-        return new SequenceNumber(packet.getData()[5], packet.getData()[6]);
+        return new SequenceNumber(packet.getData()[4], packet.getData()[5]);
     }
 }
 
@@ -119,7 +185,7 @@ class AcknowledgeNumber extends TwoByteNumber {
     }
 
     public static AcknowledgeNumber parseFromDatagramPacket(DatagramPacket packet) {
-        return new AcknowledgeNumber(packet.getData()[7], packet.getData()[8]);
+        return new AcknowledgeNumber(packet.getData()[6], packet.getData()[7]);
     }
 }
 
@@ -153,6 +219,15 @@ class FlagNumber {
     public static FlagNumber parseFromDatagramPacket(DatagramPacket packet) {
         return new FlagNumber(packet.getData()[8]);
     }
+
+    public boolean isClosing() {
+        return this.getBytes() == FIN_FLAG || this.getBytes() == RST_FLAG;
+    }
+
+    @Override
+    public String toString() {
+        return String.format("%01X", bytes);
+    }
 }
 
 class PacketData {
@@ -167,7 +242,7 @@ class PacketData {
     }
 
     public int getLength() {
-        return bytes.length;
+        return bytes != null && bytes.length > 0 ? bytes.length : 0;
     }
 
     public byte[] getBytes() {
@@ -182,8 +257,10 @@ class PacketData {
         return new PacketData(new byte[]{FIRMWARE_COMMAND});
     }
 
-    public static PacketData parseFromDatagramPacket() {
-        return null;
+    public static PacketData parseFromDatagramPacket(DatagramPacket packet) {
+        byte[] buf = new byte[packet.getData().length - 9];
+        System.arraycopy(packet.getData(), 0, buf, 0, packet.getData().length - 9);
+        return new PacketData(buf);
     }
 }
 
@@ -219,6 +296,17 @@ class KarelPacket {
         message[8] = flag.getBytes();
         System.arraycopy(data.getBytes(), 0, message, 9, data.getBytes().length);
         return message;
+    }
+
+    @Override
+    public String toString() {
+        return String.format("id=%s seq=%s ack=%s flag=%s data(%d)",
+                id.toString(),
+                sq.toString(),
+                ack.toString(),
+                flag.toString(),
+                data.getLength()
+        );
     }
 
     public ConnectionId getId() {
@@ -290,7 +378,19 @@ class KarelPacket {
                 SequenceNumber.parseFromDatagramPacket(packet),
                 AcknowledgeNumber.parseFromDatagramPacket(packet),
                 FlagNumber.parseFromDatagramPacket(packet),
-                PacketData.parseFromDatagramPacket()
+                PacketData.parseFromDatagramPacket(packet)
+        );
+    }
+
+    public static KarelPacket createAcknowledgePacket(ConnectionId connectionId, SequenceNumber sq, FlagNumber flag, PacketData data) {
+        int sum = data.getLength() + Helpers.byteArrayToInt(sq.getBytes());
+        byte[] acknowledge = Helpers.intToByteArray(sum);
+        return new KarelPacket(
+                connectionId,
+                new SequenceNumber(0x0, 0x0),
+                new AcknowledgeNumber(acknowledge[2], acknowledge[3]),
+                flag,
+                new PacketData(new byte[]{})
         );
     }
 }
