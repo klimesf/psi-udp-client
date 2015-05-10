@@ -4,7 +4,7 @@ import java.io.IOException;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.net.*;
-import java.util.Random;
+import java.util.*;
 import java.util.concurrent.*;
 
 /**
@@ -48,7 +48,12 @@ public class Robot {
  */
 class Helpers {
     public static Integer byteArrayToInt(byte[] bytes) {
-        return new BigInteger(bytes).intValue();
+        Integer value = new BigInteger(bytes).intValue();
+        if (value < 0) {
+            value = value & 0x0000ffff;
+            return value;
+        }
+        return value;
     }
 
     public static byte[] intToByteArray(int value) {
@@ -81,35 +86,112 @@ class PhotoReceiver implements SocketHandler {
     }
 
     public void handle() throws IOException, CorruptedPacketException {
-
         this.openConnection();
-        while (!socket.isClosed()) {
-            this.receiveData();
-        }
+        this.receiveData();
     }
 
     private void receiveData() throws IOException, CorruptedPacketException {
         DatagramPacket packet;
-        KarelPacket karelPacket;
-        //
-        // Receive reply with data
-        //
-        packet = new DatagramPacket(new byte[255 + 9], 255 + 9);
-        socket.receive(packet);
-        karelPacket = KarelPacket.parseFromDatagramPacket(packet);
-        System.out.println("RECV(data): " + karelPacket.toString());
+        KarelPacket receivedKarelPacket, newKarelPacket;
 
-        //
-        // Reply with acknowledge
-        //
-        if (karelPacket.getId().equals(connectionId)) {
-            karelPacket = KarelPacket.createAcknowledgePacket(connectionId, karelPacket.getSq(), karelPacket.getFlag(), karelPacket.getData());
-            packet = karelPacket.createDatagramPacket(address, port);
-            socket.send(packet);
-            System.out.println("SEND(ack): " + karelPacket.toString());
+        List<Map<Integer, KarelPacket>> packetsList = new LinkedList<>();
+        Map<Integer, KarelPacket> currentPackets = new HashMap<>();
+        int pointer = 0;
+        long total = 0;
 
-            if (karelPacket.getFlag().isClosing()) {
-                socket.close();
+        while (!socket.isClosed()) {
+            newKarelPacket = null; // Reset new packet
+
+            // Receive reply with data
+            packet = new DatagramPacket(new byte[255 + 9], 255 + 9);
+            socket.receive(packet);
+            receivedKarelPacket = KarelPacket.parseFromDatagramPacket(packet);
+
+            if (receivedKarelPacket.getSq().toInteger() == 7392) {
+                System.out.printf("RECV(data): %s\n", receivedKarelPacket.toString());
+            }
+//            System.out.println("RECV(data): " + receivedKarelPacket.toString());
+
+            // Reply with acknowledge
+            if (receivedKarelPacket.getId().equals(connectionId)) {
+                if (receivedKarelPacket.getFlag().isCarryingData()) {
+                    if (receivedKarelPacket.getSq().toInteger() == pointer) {
+                        // If we received packet which continues in the window
+                        currentPackets.put(pointer, receivedKarelPacket);
+                        pointer += receivedKarelPacket.getData().getLength();
+                        total += receivedKarelPacket.getData().getLength();
+                        // If we already received packets further in the window
+                        while (currentPackets.containsKey(pointer)) {
+                            total += currentPackets.get(pointer).getData().getLength();
+                            pointer += currentPackets.get(pointer).getData().getLength();
+                        }
+                        System.out.printf("WINDOW: pointer: %d, total: %d\n", pointer, total);
+                        newKarelPacket = KarelPacket.createAcknowledgePacket(connectionId, pointer, receivedKarelPacket.getFlag());
+
+                    } else if (receivedKarelPacket.getSq().toInteger() > pointer) {
+                        // If we received packet which is further in line than the pointer
+//                    System.out.println("Received packet which doesn't follow up, saving for further use.");
+                        currentPackets.put(receivedKarelPacket.getSq().toInteger(), receivedKarelPacket);
+                        newKarelPacket = KarelPacket.createAcknowledgePacket(connectionId, pointer, receivedKarelPacket.getFlag());
+
+                    } else if (receivedKarelPacket.getSq().toInteger() < pointer) {
+                        if (receivedKarelPacket.getFlag().isCarryingData()) {
+                            // If sq is lower than the pointer
+                            if (currentPackets.containsKey(receivedKarelPacket.getSq().toInteger())) {
+                                // If we received packet which we already had
+                                newKarelPacket = KarelPacket.createAcknowledgePacket(connectionId, pointer, receivedKarelPacket.getFlag());
+                            } else {
+                                // If the pointer overflowed
+                                packetsList.add(currentPackets);
+                                System.out.printf("Creating new packet list, current size is: %d\n", packetsList.size());
+                                currentPackets = new HashMap<>();
+                                pointer = receivedKarelPacket.getSq().toInteger();
+                                currentPackets.put(pointer, receivedKarelPacket);
+                                pointer += receivedKarelPacket.getData().getLength();
+                                total += receivedKarelPacket.getData().getLength();
+                                // If we already received packets further in the window
+                                while (currentPackets.containsKey(pointer)) {
+                                    total += currentPackets.get(pointer).getData().getLength();
+                                    pointer += currentPackets.get(pointer).getData().getLength();
+                                }
+                                System.out.printf("WINDOW: pointer: %d, total: %d\n", pointer, total);
+                                newKarelPacket = KarelPacket.createAcknowledgePacket(connectionId, pointer, receivedKarelPacket.getFlag());
+                            }
+                        }
+                    }
+
+                } else if (receivedKarelPacket.getFlag().isClosingConnection()) {
+                    if (receivedKarelPacket.getFlag().isFinishing()) {
+                        System.out.println("Received a finishing packet.");
+                        newKarelPacket = KarelPacket.createAcknowledgePacket(connectionId, receivedKarelPacket.getSq().toInteger(), receivedKarelPacket.getFlag());
+                    } else {
+                        System.out.println("Received an error packet.");
+                    }
+                }
+                // Send acknowledge packet
+                if (newKarelPacket != null) {
+                    // Else, if we should send ack packet, send it
+                    if (newKarelPacket.getAck().toInteger() == 7647) {
+                        byte[] ack = Helpers.intToByteArray(7610);
+                        newKarelPacket = KarelPacket.createPacket(
+                                newKarelPacket.getId(),
+                                newKarelPacket.getSq(),
+                                new AcknowledgeNumber(ack[2], ack[3]),
+                                newKarelPacket.getFlag(),
+                                new PacketData(new byte[]{})
+                        );
+                    }
+                    packet = newKarelPacket.createDatagramPacket(address, port);
+                    socket.send(packet);
+//                    System.out.println("SEND(ack): " + newKarelPacket.toString());
+                }
+
+                // If we received closing flag packet, shutdown the connection
+                if (receivedKarelPacket.getFlag().isClosingConnection()) {
+                    System.out.println("Shutting down...");
+                    socket.close();
+                    break;
+                }
             }
         }
     }
@@ -132,11 +214,12 @@ class PhotoReceiver implements SocketHandler {
             } catch (ExecutionException e) {
             } catch (TimeoutException e) {
                 if (connectionId == null) {
-                    System.out.println("Packet SYN se ztratil, posilam novy.");
+                    System.out.println("Opening packet has been lost, sending a new one.");
                 }
             }
         }
         futureResult.cancel(true);
+        executorService.shutdown();
     }
 
     private class InitPacketReceiver implements Runnable {
@@ -300,7 +383,7 @@ class FlagNumber {
         return new FlagNumber(SYN_FLAG);
     }
 
-    public static FlagNumber createClosingFlag() {
+    public static FlagNumber createFinishingFlag() {
         return new FlagNumber(FIN_FLAG);
     }
 
@@ -312,7 +395,7 @@ class FlagNumber {
         return new FlagNumber(packet.getData()[8]);
     }
 
-    public boolean isClosing() {
+    public boolean isClosingConnection() {
         return this.getBytes() == FIN_FLAG || this.getBytes() == RST_FLAG;
     }
 
@@ -320,8 +403,16 @@ class FlagNumber {
         return this.getBytes() == SYN_FLAG;
     }
 
+    public boolean isFinishing() {
+        return this.getBytes() == FIN_FLAG;
+    }
+
+    public boolean isCancel() {
+        return this.getBytes() == RST_FLAG;
+    }
+
     public boolean isCarryingData() {
-        return !this.isClosing() && !this.isOpening();
+        return !this.isClosingConnection() && !this.isOpening();
     }
 
     @Override
@@ -340,12 +431,30 @@ class PacketData {
     private final static byte FIRMWARE_COMMAND = 0x1;
 
     private final byte[] bytes;
+    private int length = -1;
 
     PacketData(byte[] data) {
         this.bytes = data;
     }
 
     public int getLength() {
+//        if (length < 0) {
+//            if (bytes == null || bytes.length < 1) {
+//                length = 0;
+//            }
+//            int i = bytes.length - 1;
+//            while (i > 0) {
+//                if (bytes[i] == 0) {
+//                    continue;
+//                } else {
+//                    break;
+//                }
+//            }
+//            if (length > 240) length = 255; // Correction?
+//            length = i + 1;
+//        }
+//        return length;
+
         return bytes != null && bytes.length > 0 ? bytes.length : 0;
     }
 
@@ -513,14 +622,11 @@ class KarelPacket {
      * Creates packet which acknowledges the server about accepted sequence of data.
      *
      * @param connectionId Id of the connection.
-     * @param sq           Sequence number of the packet.
-     * @param flag         Flag number of the packet.
-     * @param data         Data of the packet.
+     * @param pointer      Value of the pointer.
      * @return The KarelPacket with acknowledge data.
      */
-    public static KarelPacket createAcknowledgePacket(ConnectionId connectionId, SequenceNumber sq, FlagNumber flag, PacketData data) {
-        int sum = data.getLength() + Helpers.byteArrayToInt(sq.getBytes());
-        byte[] acknowledge = Helpers.intToByteArray(sum);
+    public static KarelPacket createAcknowledgePacket(ConnectionId connectionId, Integer pointer, FlagNumber flag) {
+        byte[] acknowledge = Helpers.intToByteArray(pointer);
         return new KarelPacket(
                 connectionId,
                 new SequenceNumber(0x0, 0x0),
