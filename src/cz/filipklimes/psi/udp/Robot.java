@@ -1,5 +1,7 @@
 package cz.filipklimes.psi.udp;
 
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
@@ -41,28 +43,6 @@ public class Robot {
     }
 }
 
-/**
- * Helpers for conversion between byte array and integer.
- *
- * @author klimesf
- */
-class Helpers {
-    public static Integer byteArrayToInt(byte[] bytes) {
-        Integer value = new BigInteger(bytes).intValue();
-        if (value < 0) {
-            value = value & 0x0000ffff;
-            return value;
-        }
-        return value;
-    }
-
-    public static byte[] intToByteArray(int value) {
-        ByteBuffer dbuf = ByteBuffer.allocate(4);
-        dbuf.putInt(value);
-        return dbuf.array();
-    }
-}
-
 interface SocketHandler {
     void handle() throws IOException, CorruptedPacketException;
 }
@@ -78,6 +58,8 @@ class PhotoReceiver implements SocketHandler {
     private final InetAddress address;
     private final Integer port;
     private ConnectionId connectionId;
+    private final List<Map<Integer, KarelPacket>> packetsList = new LinkedList<>();
+    private Map<Integer, KarelPacket> currentPackets;
 
     PhotoReceiver(DatagramSocket socket, InetAddress address, Integer port) {
         this.socket = socket;
@@ -88,14 +70,37 @@ class PhotoReceiver implements SocketHandler {
     public void handle() throws IOException, CorruptedPacketException {
         this.openConnection();
         this.receiveData();
+        this.savePhoto();
+    }
+
+    private void savePhoto() throws FileNotFoundException {
+        packetsList.add(currentPackets); // Last currentPackets hasn't been added
+        System.out.println("Saving photo");
+        int i = 0;
+        try {
+            FileOutputStream fos = new FileOutputStream("foto.png");
+            Iterator<Map<Integer, KarelPacket>> it = packetsList.iterator();
+            while (it.hasNext()) {
+//                System.out.printf("List no: %d\n", ++i);
+                Map<Integer, KarelPacket> map = it.next();
+                SortedSet<Integer> keys = new TreeSet<>(map.keySet());
+                for (Integer key : keys) {
+//                    System.out.printf("Arr no: %d\n", key);
+                    KarelPacket value = map.get(key);
+                    fos.write(value.getData().getBytes());
+                }
+            }
+            fos.close();
+        } catch (IOException e) {
+        }
+        System.out.println("Saved to foto.png");
     }
 
     private void receiveData() throws IOException, CorruptedPacketException {
         DatagramPacket packet;
         KarelPacket receivedKarelPacket, newKarelPacket;
 
-        List<Map<Integer, KarelPacket>> packetsList = new LinkedList<>();
-        Map<Integer, KarelPacket> currentPackets = new HashMap<>();
+        currentPackets = new HashMap<>();
         int pointer = 0;
         long total = 0;
 
@@ -107,13 +112,11 @@ class PhotoReceiver implements SocketHandler {
             socket.receive(packet);
             receivedKarelPacket = KarelPacket.parseFromDatagramPacket(packet);
 
-            if (receivedKarelPacket.getSq().toInteger() == 7392) {
-                System.out.printf("RECV(data): %s\n", receivedKarelPacket.toString());
-            }
 //            System.out.println("RECV(data): " + receivedKarelPacket.toString());
 
             // Reply with acknowledge
             if (receivedKarelPacket.getId().equals(connectionId)) {
+                System.out.printf("\b\b\b\b\b%3d%%\n", Math.round(((double) total / 202215.) * 100));
                 if (receivedKarelPacket.getFlag().isCarryingData()) {
                     if (receivedKarelPacket.getSq().toInteger() == pointer) {
                         // If we received packet which continues in the window
@@ -125,7 +128,7 @@ class PhotoReceiver implements SocketHandler {
                             total += currentPackets.get(pointer).getData().getLength();
                             pointer += currentPackets.get(pointer).getData().getLength();
                         }
-                        System.out.printf("WINDOW: pointer: %d, total: %d\n", pointer, total);
+//                        System.out.printf("WINDOW: pointer: %d, total: %d\n", pointer, total);
                         newKarelPacket = KarelPacket.createAcknowledgePacket(connectionId, pointer, receivedKarelPacket.getFlag());
 
                     } else if (receivedKarelPacket.getSq().toInteger() > pointer) {
@@ -143,7 +146,7 @@ class PhotoReceiver implements SocketHandler {
                             } else {
                                 // If the pointer overflowed
                                 packetsList.add(currentPackets);
-                                System.out.printf("Creating new packet list, current size is: %d\n", packetsList.size());
+//                                System.out.printf("Creating new packet list, current size is: %d\n", packetsList.size());
                                 currentPackets = new HashMap<>();
                                 pointer = receivedKarelPacket.getSq().toInteger();
                                 currentPackets.put(pointer, receivedKarelPacket);
@@ -154,7 +157,7 @@ class PhotoReceiver implements SocketHandler {
                                     total += currentPackets.get(pointer).getData().getLength();
                                     pointer += currentPackets.get(pointer).getData().getLength();
                                 }
-                                System.out.printf("WINDOW: pointer: %d, total: %d\n", pointer, total);
+//                                System.out.printf("WINDOW: pointer: %d, total: %d\n", pointer, total);
                                 newKarelPacket = KarelPacket.createAcknowledgePacket(connectionId, pointer, receivedKarelPacket.getFlag());
                             }
                         }
@@ -162,7 +165,7 @@ class PhotoReceiver implements SocketHandler {
 
                 } else if (receivedKarelPacket.getFlag().isClosingConnection()) {
                     if (receivedKarelPacket.getFlag().isFinishing()) {
-                        System.out.println("Received a finishing packet.");
+                        System.out.printf("Received a finishing packet. Received %d bytes during this session.\n", total);
                         newKarelPacket = KarelPacket.createAcknowledgePacket(connectionId, receivedKarelPacket.getSq().toInteger(), receivedKarelPacket.getFlag());
                     } else {
                         System.out.println("Received an error packet.");
@@ -249,7 +252,7 @@ class PhotoReceiver implements SocketHandler {
         karelPacket = KarelPacket.createOpeningPacket(PacketData.createPhotoCommand());
         packet = karelPacket.createDatagramPacket(address, port);
         socket.send(packet);
-        System.out.println("SEND(init): " + karelPacket.toString());
+//        System.out.println("SEND(init): " + karelPacket.toString());
     }
 
     private void receiveInitPacket(DatagramSocket socket) throws CorruptedPacketException, IOException {
@@ -260,19 +263,40 @@ class PhotoReceiver implements SocketHandler {
 
         if (karelPacket.getFlag().isOpening()) {
             connectionId = karelPacket.getId();
-            System.out.println("RECV(init): " + karelPacket.toString());
+//            System.out.println("RECV(init): " + karelPacket.toString());
             System.out.printf("Opened connection with id %s\n", connectionId.toString());
         } else if (karelPacket.getFlag().isCarryingData()) {
-            System.out.println("RECV(init): rubbish");
+//            System.out.println("RECV(init): rubbish");
         }
     }
 }
 
 
 // *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *
-// --- PACKETS --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- -
+// --- PACKET  --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- -
 // *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *
 
+/**
+ * Helpers for conversion between byte array and integer.
+ *
+ * @author klimesf
+ */
+class Helpers {
+    public static Integer byteArrayToInt(byte[] bytes) {
+        Integer value = new BigInteger(bytes).intValue();
+        if (value < 0) {
+            value = value & 0x0000ffff;
+            return value;
+        }
+        return value;
+    }
+
+    public static byte[] intToByteArray(int value) {
+        ByteBuffer dbuf = ByteBuffer.allocate(4);
+        dbuf.putInt(value);
+        return dbuf.array();
+    }
+}
 
 abstract class TwoByteNumber {
     private final byte[] bytes;
@@ -420,7 +444,6 @@ class FlagNumber {
         return String.format("%01X", bytes);
     }
 }
-
 
 /**
  * Data of KarelPacket.
