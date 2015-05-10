@@ -2,11 +2,20 @@ package cz.filipklimes.psi.udp;
 
 import java.io.IOException;
 import java.math.BigInteger;
-import java.net.*;
 import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
+import java.net.*;
+import java.util.Random;
+import java.util.concurrent.*;
 
 /**
+ * DISCLAIMER: This code is full of technical debt. It has been written under deadline pressure and huge amount of
+ * frustration. All classes must be in one file because a genius at FEE CTU decided it's the best way to implement
+ * a program in Java.
+ */
+
+/**
+ * Main class of the program.
+ *
  * @author klimesf
  */
 public class Robot {
@@ -23,7 +32,8 @@ public class Robot {
 
         System.out.printf("Connecting to server %s:%s\n", args[0], portTo);
 
-        PhotoReciever.recievePhoto(socket, address, portTo);
+        SocketHandler handler = new PhotoReceiver(socket, address, portTo);
+        handler.handle();
 
         if (!socket.isClosed()) {
             socket.close();
@@ -31,6 +41,11 @@ public class Robot {
     }
 }
 
+/**
+ * Helpers for conversion between byte array and integer.
+ *
+ * @author klimesf
+ */
 class Helpers {
     public static Integer byteArrayToInt(byte[] bytes) {
         return new BigInteger(bytes).intValue();
@@ -43,52 +58,129 @@ class Helpers {
     }
 }
 
-class PhotoReciever {
+interface SocketHandler {
+    void handle() throws IOException, CorruptedPacketException;
+}
 
-    public static void recievePhoto(DatagramSocket socket, InetAddress address, Integer port) throws IOException, CorruptedPacketException {
+/**
+ * Receives photos.
+ *
+ * @author klimesf
+ */
+class PhotoReceiver implements SocketHandler {
+
+    private final DatagramSocket socket;
+    private final InetAddress address;
+    private final Integer port;
+    private ConnectionId connectionId;
+
+    PhotoReceiver(DatagramSocket socket, InetAddress address, Integer port) {
+        this.socket = socket;
+        this.address = address;
+        this.port = port;
+    }
+
+    public void handle() throws IOException, CorruptedPacketException {
+
+        this.openConnection();
+        while (!socket.isClosed()) {
+            this.receiveData();
+        }
+    }
+
+    private void receiveData() throws IOException, CorruptedPacketException {
         DatagramPacket packet;
-        ConnectionId connectionId;
         KarelPacket karelPacket;
+        //
+        // Receive reply with data
+        //
+        packet = new DatagramPacket(new byte[255 + 9], 255 + 9);
+        socket.receive(packet);
+        karelPacket = KarelPacket.parseFromDatagramPacket(packet);
+        System.out.println("RECV(data): " + karelPacket.toString());
 
         //
-        // Init connection
+        // Reply with acknowledge
         //
+        if (karelPacket.getId().equals(connectionId)) {
+            karelPacket = KarelPacket.createAcknowledgePacket(connectionId, karelPacket.getSq(), karelPacket.getFlag(), karelPacket.getData());
+            packet = karelPacket.createDatagramPacket(address, port);
+            socket.send(packet);
+            System.out.println("SEND(ack): " + karelPacket.toString());
+
+            if (karelPacket.getFlag().isClosing()) {
+                socket.close();
+            }
+        }
+    }
+
+    /**
+     * Opens connection to the server.
+     *
+     * @throws IOException
+     * @throws CorruptedPacketException
+     */
+    private void openConnection() throws IOException, CorruptedPacketException {
+        ExecutorService executorService = Executors.newSingleThreadExecutor();
+        Future futureResult = executorService.submit(new InitPacketReceiver(this));
+        while (connectionId == null) {
+            this.sendInitPacket(socket, address, port);
+            try {
+                futureResult.get(100, TimeUnit.MILLISECONDS);
+            } catch (CancellationException e) {
+            } catch (InterruptedException e) {
+            } catch (ExecutionException e) {
+            } catch (TimeoutException e) {
+                if (connectionId == null) {
+                    System.out.println("Packet SYN se ztratil, posilam novy.");
+                }
+            }
+        }
+        futureResult.cancel(true);
+    }
+
+    private class InitPacketReceiver implements Runnable {
+        private PhotoReceiver parent;
+
+        public InitPacketReceiver(PhotoReceiver parent) {
+            this.parent = parent;
+        }
+
+        @Override
+        public void run() {
+            try {
+                while (connectionId == null) {
+                    parent.receiveInitPacket(socket);
+                }
+            } catch (CorruptedPacketException e) {
+            } catch (IOException e) {
+            }
+        }
+    }
+
+    private void sendInitPacket(DatagramSocket socket, InetAddress address, Integer port) throws IOException {
+        KarelPacket karelPacket;
+        DatagramPacket packet;
+
+        // Send init packet
         karelPacket = KarelPacket.createOpeningPacket(PacketData.createPhotoCommand());
         packet = karelPacket.createDatagramPacket(address, port);
         socket.send(packet);
-        System.out.println("SEND: " + karelPacket.toString());
+        System.out.println("SEND(init): " + karelPacket.toString());
+    }
 
-        //
+    private void receiveInitPacket(DatagramSocket socket) throws CorruptedPacketException, IOException {
         // Receive reply with connection id
-        //
-        packet = new DatagramPacket(new byte[255+9], 255+9);
+        DatagramPacket packet = new DatagramPacket(new byte[9], 9);
         socket.receive(packet);
-        karelPacket = KarelPacket.parseFromDatagramPacket(packet);
-        System.out.println("RECV: " + karelPacket.toString());
-        connectionId = karelPacket.getId();
+        KarelPacket karelPacket = KarelPacket.parseFromDatagramPacket(packet);
 
-        while (!socket.isClosed()) {
-            //
-            // Receive reply with data
-            //
-            packet = new DatagramPacket(new byte[255+9], 255+9);
-            socket.receive(packet);
-            karelPacket = KarelPacket.parseFromDatagramPacket(packet);
-            System.out.println("RECV: " + karelPacket.toString());
-
-            //
-            // Reply with acknowledge
-            //
-            if (karelPacket.getId().equals(connectionId)) {
-                karelPacket = KarelPacket.createAcknowledgePacket(connectionId, karelPacket.getSq(), karelPacket.getFlag(), karelPacket.getData());
-                packet = karelPacket.createDatagramPacket(address, port);
-                socket.send(packet);
-                System.out.println("SEND: " + karelPacket.toString());
-
-                if (karelPacket.getFlag().isClosing()) {
-                    break;
-                }
-            }
+        if (karelPacket.getFlag().isOpening()) {
+            connectionId = karelPacket.getId();
+            System.out.println("RECV(init): " + karelPacket.toString());
+            System.out.printf("Opened connection with id %s\n", connectionId.toString());
+        } else if (karelPacket.getFlag().isCarryingData()) {
+            System.out.println("RECV(init): rubbish");
         }
     }
 }
@@ -224,12 +316,24 @@ class FlagNumber {
         return this.getBytes() == FIN_FLAG || this.getBytes() == RST_FLAG;
     }
 
+    public boolean isOpening() {
+        return this.getBytes() == SYN_FLAG;
+    }
+
+    public boolean isCarryingData() {
+        return !this.isClosing() && !this.isOpening();
+    }
+
     @Override
     public String toString() {
         return String.format("%01X", bytes);
     }
 }
 
+
+/**
+ * Data of KarelPacket.
+ */
 class PacketData {
 
     private final static byte PHOTO_COMMAND = 0x1;
@@ -264,6 +368,10 @@ class PacketData {
     }
 }
 
+/**
+ * KarelPacket is a packet used for communicating with server Karel.
+ * It can't be sent itself, but it is an abstraction for DatagramPacket.
+ */
 class KarelPacket {
     private final ConnectionId id;
     private final SequenceNumber sq;
@@ -271,6 +379,13 @@ class KarelPacket {
     private final FlagNumber flag;
     private final PacketData data;
 
+    /**
+     * @param id   Id of the connection.
+     * @param sq   Sequence number of the packet.
+     * @param ack  Acknowledge number of the packet.
+     * @param flag Flag number of the packet.
+     * @param data Data of the packet.
+     */
     public KarelPacket(ConnectionId id,
                        SequenceNumber sq,
                        AcknowledgeNumber ack,
@@ -283,19 +398,16 @@ class KarelPacket {
         this.data = data;
     }
 
+    /**
+     * Creates datagram packet containing the data of this KarelPacket.
+     *
+     * @param address Address the packet should be sent to.
+     * @param port    Port the packet should be sent to.
+     * @return The DatagramPacket.
+     */
     public DatagramPacket createDatagramPacket(InetAddress address, Integer port) {
-        byte[] message = this.buildMessage();
+        byte[] message = this.buildBytes();
         return new DatagramPacket(message, message.length, address, port);
-    }
-
-    private byte[] buildMessage() {
-        byte[] message = new byte[4 + 2 + 2 + 1 + data.getLength()];
-        System.arraycopy(id.getBytes(), 0, message, 0, 4);
-        System.arraycopy(sq.getBytes(), 0, message, 4, 2);
-        System.arraycopy(ack.getBytes(), 0, message, 6, 2);
-        message[8] = flag.getBytes();
-        System.arraycopy(data.getBytes(), 0, message, 9, data.getBytes().length);
-        return message;
     }
 
     @Override
@@ -327,6 +439,21 @@ class KarelPacket {
 
     public PacketData getData() {
         return data;
+    }
+
+    /**
+     * Builds byte array for DatagramPacket.
+     *
+     * @return The byte array with all information.
+     */
+    private byte[] buildBytes() {
+        byte[] message = new byte[4 + 2 + 2 + 1 + data.getLength()];
+        System.arraycopy(id.getBytes(), 0, message, 0, 4);
+        System.arraycopy(sq.getBytes(), 0, message, 4, 2);
+        System.arraycopy(ack.getBytes(), 0, message, 6, 2);
+        message[8] = flag.getBytes();
+        System.arraycopy(data.getBytes(), 0, message, 9, data.getBytes().length);
+        return message;
     }
 
     /**
@@ -382,6 +509,15 @@ class KarelPacket {
         );
     }
 
+    /**
+     * Creates packet which acknowledges the server about accepted sequence of data.
+     *
+     * @param connectionId Id of the connection.
+     * @param sq           Sequence number of the packet.
+     * @param flag         Flag number of the packet.
+     * @param data         Data of the packet.
+     * @return The KarelPacket with acknowledge data.
+     */
     public static KarelPacket createAcknowledgePacket(ConnectionId connectionId, SequenceNumber sq, FlagNumber flag, PacketData data) {
         int sum = data.getLength() + Helpers.byteArrayToInt(sq.getBytes());
         byte[] acknowledge = Helpers.intToByteArray(sum);
@@ -395,6 +531,9 @@ class KarelPacket {
     }
 }
 
+/**
+ * Exception which is thrown when the program finds out that incoming packet is corrupted.
+ */
 class CorruptedPacketException extends Exception {
     public CorruptedPacketException(String s) {
         super(s);
