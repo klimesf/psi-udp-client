@@ -75,7 +75,7 @@ class PhotoReceiver implements SocketHandler {
 
     private void savePhoto() throws FileNotFoundException {
         packetsList.add(currentPackets); // Last currentPackets hasn't been added
-        System.out.println("Saving photo");
+        System.out.println("Saving photo to \"foto.png.\"");
         int i = 0;
         try {
             FileOutputStream fos = new FileOutputStream("foto.png");
@@ -93,7 +93,7 @@ class PhotoReceiver implements SocketHandler {
             fos.close();
         } catch (IOException e) {
         }
-        System.out.println("Saved to foto.png");
+        System.out.println("Photo saved.");
     }
 
     private void receiveData() throws IOException, CorruptedPacketException {
@@ -103,6 +103,8 @@ class PhotoReceiver implements SocketHandler {
         currentPackets = new HashMap<>();
         int pointer = 0;
         long total = 0;
+
+        System.out.println("Starting to download photo: \n\n");
 
         while (!socket.isClosed()) {
             newKarelPacket = null; // Reset new packet
@@ -116,7 +118,21 @@ class PhotoReceiver implements SocketHandler {
 
             // Reply with acknowledge
             if (receivedKarelPacket.getId().equals(connectionId)) {
-                System.out.printf("\b\b\b\b\b%3d%%\n", Math.round(((double) total / 202215.) * 100));
+                long percent = Math.round(((double) total / 204218.) * 100);
+                int milestone = 100 / 50;
+                StringBuilder sb = new StringBuilder(52).append('|');
+                for(int i = 0; i < 100; i++) {
+                    if ((i + 1) % milestone == 0) {
+                        if (i < percent) {
+                            sb.append('#');
+                        } else {
+                            sb.append(' ');
+                        }
+                    }
+                }
+                sb.append('|');
+                System.out.printf("%3d%% %s\n", percent, sb.toString());
+
                 if (receivedKarelPacket.getFlag().isCarryingData()) {
                     if (receivedKarelPacket.getSq().toInteger() == pointer) {
                         // If we received packet which continues in the window
@@ -191,7 +207,7 @@ class PhotoReceiver implements SocketHandler {
 
                 // If we received closing flag packet, shutdown the connection
                 if (receivedKarelPacket.getFlag().isClosingConnection()) {
-                    System.out.println("Shutting down...");
+                    System.out.println("Closing connection.");
                     socket.close();
                     break;
                 }
@@ -217,7 +233,7 @@ class PhotoReceiver implements SocketHandler {
             } catch (ExecutionException e) {
             } catch (TimeoutException e) {
                 if (connectionId == null) {
-                    System.out.println("Opening packet has been lost, sending a new one.");
+                    System.err.println("Opening packet has been lost, sending a new one.");
                 }
             }
         }
@@ -264,7 +280,7 @@ class PhotoReceiver implements SocketHandler {
         if (karelPacket.getFlag().isOpening()) {
             connectionId = karelPacket.getId();
 //            System.out.println("RECV(init): " + karelPacket.toString());
-            System.out.printf("Opened connection with id %s\n", connectionId.toString());
+            System.out.printf("Opened connection with id %s.\n", connectionId.toString());
         } else if (karelPacket.getFlag().isCarryingData()) {
 //            System.out.println("RECV(init): rubbish");
         }
