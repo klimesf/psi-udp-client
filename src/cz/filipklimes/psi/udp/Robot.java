@@ -114,60 +114,15 @@ class PhotoReceiver implements SocketHandler {
                 System.out.println("RECV(data): " + receivedKarelPacket.toString());
             }
 
-            // Reply with acknowledge
+            // Process the packet and reply with acknowledge
             if (receivedKarelPacket.getId().equals(connectionId)) {
-
-                if (!Robot.verbose) {
-                    long percent = Math.round(((double) totalBytes / 204218.) * 100);
-                    int milestone = 100 / 50;
-                    StringBuilder sb = new StringBuilder(52).append('|');
-                    for (int i = 0; i < 100; i++) {
-                        if ((i + 1) % milestone == 0) {
-                            if (i < percent) {
-                                sb.append('#');
-                            } else {
-                                sb.append(' ');
-                            }
-                        }
-                    }
-                    sb.append('|');
-                    System.out.printf("%3d%% %s\n", percent, sb.toString());
-                }
-
-                int pointerBefore = pointer;
+                printPercent();
+                int pointerBefore = pointer; // Just for the lulz
 
                 if (receivedKarelPacket.getFlag().isCarryingData()) {
-                    if (receivedKarelPacket.getSq().toInteger().equals(pointer)) {
-                        // If we received packet which continues in the window
-                        ackKarelPacket = acceptPacket(receivedKarelPacket);
-
-                    } else if (receivedKarelPacket.getSq().toInteger().compareTo(pointer) > 0) {
-                        // If we received packet which is further in line than the pointer
-                        if (Robot.verbose) {
-                            System.out.println("Received packet which doesn't follow up, saving for further use.");
-                        }
-                        ackKarelPacket = saveForFurtherUser(receivedKarelPacket);
-
-                    } else { // if (receivedKarelPacket.getSq().toInteger().compareTo(pointer) < 0) {
-                        // If sq is lower than the pointer
-                        if (receivedKeys.contains(receivedKarelPacket.getSq().toInteger())) {
-                            // If we received packet which we already had
-                            ackKarelPacket = KarelPacket.createAcknowledgePacket(connectionId, pointer, receivedKarelPacket.getFlag());
-                        } else {
-                            // If the pointer overflowed
-                            receivedKeys = new HashSet<>();
-                            pointer = receivedKarelPacket.getSq().toInteger();
-                            ackKarelPacket = acceptPacket(receivedKarelPacket);
-                        }
-                    }
-
+                    ackKarelPacket = receiveDataPacket(receivedKarelPacket);
                 } else if (receivedKarelPacket.getFlag().isClosingConnection()) {
-                    if (receivedKarelPacket.getFlag().isFinishing()) {
-                        System.out.printf("Received a finishing packet. Received %d bytes in %d successful of %d total packets during this session.\n", totalBytes, successfulPackets, totalPackets);
-                        ackKarelPacket = KarelPacket.createAcknowledgePacket(connectionId, receivedKarelPacket.getSq().toInteger(), receivedKarelPacket.getFlag());
-                    } else {
-                        System.out.println("Received an error packet.");
-                    }
+                    ackKarelPacket = receiveClosingPacket(receivedKarelPacket);
                 } else {
                     throw new RuntimeException("Unknown type of packet.");
                 }
@@ -178,9 +133,7 @@ class PhotoReceiver implements SocketHandler {
                 }
 
                 // Send acknowledge packet
-                if (ackKarelPacket != null) {
-                    sendAcknowledgePacket(ackKarelPacket);
-                }
+                sendAcknowledgePacket(ackKarelPacket);
 
                 // If we received closing flag packet, shutdown the connection
                 if (receivedKarelPacket.getFlag().isClosingConnection()) {
@@ -191,6 +144,76 @@ class PhotoReceiver implements SocketHandler {
             } else {
                 System.out.println("RECV wrong connection id");
             }
+        }
+    }
+
+    /**
+     * Receives closing KarelPacket and creates appropriate response.
+     *
+     * @param receivedKarelPacket The received closing packet.
+     * @return The response packet. Could be null, if no response should be sent.
+     */
+    private KarelPacket receiveClosingPacket(KarelPacket receivedKarelPacket) {
+        if (receivedKarelPacket.getFlag().isFinishing()) {
+            System.out.printf("Received a finishing packet. Received %d bytes in %d successful of %d total packets during this session.\n", totalBytes, successfulPackets, totalPackets);
+            return KarelPacket.createAcknowledgePacket(connectionId, receivedKarelPacket.getSq().toInteger(), receivedKarelPacket.getFlag());
+        } else {
+            System.out.println("Received an error packet.");
+            return null;
+        }
+    }
+
+    /**
+     * Receives data packet and creates appropriate response.
+     *
+     * @param receivedKarelPacket The received data packet.
+     * @return The response packet. Could be null, if no response should be sent.
+     * @throws IOException
+     */
+    private KarelPacket receiveDataPacket(KarelPacket receivedKarelPacket) throws IOException {
+        KarelPacket ackKarelPacket;
+        if (receivedKarelPacket.getSq().toInteger().equals(pointer)) {
+            // If we received packet which continues in the window
+            ackKarelPacket = acceptPacket(receivedKarelPacket);
+
+        } else if (receivedKarelPacket.getSq().toInteger().compareTo(pointer) > 0) {
+            // If we received packet which is further in line than the pointer
+            if (Robot.verbose) {
+                System.out.println("Received packet which doesn't follow up, saving for further use.");
+            }
+            ackKarelPacket = saveForFurtherUser(receivedKarelPacket);
+
+        } else { // if (receivedKarelPacket.getSq().toInteger().compareTo(pointer) < 0) {
+            // If sq is lower than the pointer
+            if (receivedKeys.contains(receivedKarelPacket.getSq().toInteger())) {
+                // If we received packet which we already had
+                ackKarelPacket = KarelPacket.createAcknowledgePacket(connectionId, pointer, receivedKarelPacket.getFlag());
+            } else {
+                // If the pointer overflowed
+                receivedKeys = new HashSet<>();
+                pointer = receivedKarelPacket.getSq().toInteger();
+                ackKarelPacket = acceptPacket(receivedKarelPacket);
+            }
+        }
+        return ackKarelPacket;
+    }
+
+    private void printPercent() {
+        if (!Robot.verbose) {
+            long percent = Math.round(((double) totalBytes / 204218.) * 100);
+            int milestone = 100 / 50;
+            StringBuilder sb = new StringBuilder(52).append('|');
+            for (int i = 0; i < 100; i++) {
+                if ((i + 1) % milestone == 0) {
+                    if (i < percent) {
+                        sb.append('#');
+                    } else {
+                        sb.append(' ');
+                    }
+                }
+            }
+            sb.append('|');
+            System.out.printf("%3d%% %s\n", percent, sb.toString());
         }
     }
 
@@ -246,11 +269,13 @@ class PhotoReceiver implements SocketHandler {
      * @throws IOException
      */
     private void sendAcknowledgePacket(KarelPacket ackKarelPacket) throws IOException {
-        DatagramPacket packet;// Else, if we should send ack packet, send it
-        packet = ackKarelPacket.createDatagramPacket(address, port);
-        socket.send(packet);
-        if (Robot.verbose) {
-            System.out.println("SEND(ack): " + ackKarelPacket.toString());
+        if (ackKarelPacket != null) {
+            DatagramPacket packet;// Else, if we should send ack packet, send it
+            packet = ackKarelPacket.createDatagramPacket(address, port);
+            socket.send(packet);
+            if (Robot.verbose) {
+                System.out.println("SEND(ack): " + ackKarelPacket.toString());
+            }
         }
     }
 
