@@ -1,8 +1,6 @@
 package cz.filipklimes.psi.udp;
 
-import java.io.FileNotFoundException;
-import java.io.FileOutputStream;
-import java.io.IOException;
+import java.io.*;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.net.*;
@@ -32,18 +30,27 @@ public class Robot {
         int fromPort = Robot.PORT_FROM, portTo = Robot.PORT_TO;
         socket = new DatagramSocket(fromPort);
         address = InetAddress.getByName(args[0]);
+        String firmwareFileName = null;
 
         for (String val : args) {
             if (val.equals("-v")) {
                 Robot.verbose = true;
-                break;
+                continue;
+            }
+            if (val.contains("firmware")) {
+                firmwareFileName = val;
             }
         }
 
         System.out.printf("Connecting to server %s:%s\n", args[0], portTo);
 
-        SocketHandler handler = new PhotoReceiver(socket, address, portTo);
-        handler.handle();
+        if (firmwareFileName == null) {
+            SocketHandler handler = new PhotoReceiver(socket, address, portTo);
+            handler.handle();
+        } else {
+            SocketHandler handler = new FirmwareUploader(socket, address, portTo, firmwareFileName);
+            handler.handle();
+        }
 
         if (!socket.isClosed()) {
             socket.close();
@@ -99,7 +106,7 @@ class PhotoReceiver implements SocketHandler {
         DatagramPacket packet;
         KarelPacket receivedKarelPacket, ackKarelPacket;
 
-        System.out.println("Starting to download photo: \n\n");
+        System.out.println("Starting to download photo:\n\n");
 
         while (!socket.isClosed()) {
             ackKarelPacket = null; // Reset new packet
@@ -361,6 +368,179 @@ class PhotoReceiver implements SocketHandler {
     }
 }
 
+class FirmwareUploader implements SocketHandler {
+
+    private final DatagramSocket socket;
+    private final InetAddress address;
+    private final int port;
+    private final FileInputStream fis;
+    private ConnectionId connectionId;
+    private int pointer = 0;
+    private Map<Integer, KarelPacket> window = new HashMap<>();
+
+    public FirmwareUploader(DatagramSocket socket, InetAddress address, int port, String firmwareFileName) throws IOException {
+        this.socket = socket;
+        this.address = address;
+        this.port = port;
+        fis = new FileInputStream(firmwareFileName);
+    }
+
+    @Override
+    public void handle() throws IOException, CorruptedPacketException {
+        this.openConnection();
+        this.sendData();
+        fis.close();
+    }
+
+    private void sendData() throws IOException, CorruptedPacketException {
+        System.out.println("Starting to upload firmware:\n\n");
+        this.fillWindow(pointer);
+        this.sendWindow();
+        this.processStream();
+    }
+
+    private void processStream() throws CorruptedPacketException, IOException {
+        DatagramPacket packet;
+        while (!socket.isClosed()) {
+            packet = new DatagramPacket(new byte[255], 255);
+            socket.receive(packet);
+            KarelPacket receivedKarelPacket = KarelPacket.parseFromDatagramPacket(packet);
+            if (receivedKarelPacket.getFlag().isCarryingData()) {
+                pointer = receivedKarelPacket.getAck().toInteger();
+                if (Robot.verbose) {
+                    System.out.println("RECV " + receivedKarelPacket.toString());
+                }
+
+                this.fillWindow(pointer);
+                KarelPacket toSend = window.get(pointer);
+                packet = toSend.createDatagramPacket(address, port);
+                socket.send(packet);
+                if (Robot.verbose) {
+                    System.out.println("SEND " + toSend.toString());
+                }
+            }
+        }
+    }
+
+    private void sendWindow() throws IOException {
+        int kunda = pointer;
+        for (int i = 0; i < 8; i++) {
+            KarelPacket toSend = window.get(kunda);
+            kunda = addToKunda(toSend.getData().getLength(), kunda);
+            DatagramPacket packet = toSend.createDatagramPacket(address, port);
+            socket.send(packet);
+
+            if (Robot.verbose) {
+                System.out.println("SEND(data) " + toSend.toString());
+            }
+        }
+    }
+
+    private void fillWindow(int pointer) throws IOException {
+        int kunda = pointer;
+        for (int i = 0; i < 8; i++) {
+            if (window.containsKey(kunda)) {
+                continue;
+            }
+            KarelPacket newPacket = this.createDataPacket(kunda);
+            window.put(kunda, newPacket);
+            kunda = addToKunda(newPacket.getData().getLength(), kunda);
+        }
+    }
+
+    private KarelPacket createDataPacket(int pointer) throws IOException {
+        byte[] data = new byte[255];
+        fis.read(data, 0, (fis.available() > 255 ? 255 : fis.available()));
+        ByteBuffer bf = ByteBuffer.wrap(data);
+        byte[] buf = new byte[fis.available() > 255 ? 255 : fis.available()];
+        for (int i = 0; i < buf.length; i++) {
+            buf[i] = bf.get();
+        }
+        return KarelPacket.createDataPacket(connectionId, pointer, buf);
+    }
+
+    private void openConnection() throws IOException {
+        ExecutorService executorService = Executors.newSingleThreadExecutor();
+        Future futureResult = executorService.submit(new InitPacketReceiver(this));
+        while (connectionId == null) {
+            this.sendInitPacket(socket, address, port);
+            try {
+                futureResult.get(100, TimeUnit.MILLISECONDS);
+            } catch (CancellationException e) {
+            } catch (InterruptedException e) {
+            } catch (ExecutionException e) {
+            } catch (TimeoutException e) {
+                if (connectionId == null) {
+                    System.err.println("Opening packet has been lost, sending a new one.");
+                }
+            }
+        }
+        futureResult.cancel(true);
+        executorService.shutdown();
+    }
+
+    private class InitPacketReceiver implements Runnable {
+        private FirmwareUploader parent;
+
+        public InitPacketReceiver(FirmwareUploader parent) {
+            this.parent = parent;
+        }
+
+        @Override
+        public void run() {
+            try {
+                while (connectionId == null) {
+                    parent.receiveInitPacket(socket);
+                }
+            } catch (CorruptedPacketException e) {
+            } catch (IOException e) {
+            }
+        }
+    }
+
+    private void sendInitPacket(DatagramSocket socket, InetAddress address, Integer port) throws IOException {
+        KarelPacket karelPacket;
+        DatagramPacket packet;
+
+        // Send init packet
+        karelPacket = KarelPacket.createOpeningPacket(PacketData.createFirmwareCommand());
+        packet = karelPacket.createDatagramPacket(address, port);
+        socket.send(packet);
+        if (Robot.verbose) {
+            System.out.println("SEND(init): " + karelPacket.toString());
+        }
+    }
+
+    private void receiveInitPacket(DatagramSocket socket) throws CorruptedPacketException, IOException {
+        // Receive reply with connection id
+        DatagramPacket packet = new DatagramPacket(new byte[9], 9);
+        socket.receive(packet);
+        KarelPacket karelPacket = KarelPacket.parseFromDatagramPacket(packet);
+
+        if (karelPacket.getFlag().isOpening()) {
+            connectionId = karelPacket.getId();
+            if (Robot.verbose) {
+                System.out.println("RECV(init): " + karelPacket.toString());
+            }
+            System.out.printf("Opened connection with id %s.\n", connectionId.toString());
+        } else if (karelPacket.getFlag().isCarryingData()) {
+            if (Robot.verbose) {
+                System.out.println("RECV(init): rubbish");
+            }
+        }
+    }
+
+    private void addToPointer(int length) {
+        pointer += length;
+        pointer = (new Integer(pointer).shortValue()) & 0xffff;
+    }
+
+    private int addToKunda(int length, int kunda) {
+        kunda += length;
+        kunda = (new Integer(kunda).shortValue()) & 0xffff;
+        return kunda;
+    }
+}
 
 // *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** *
 // --- PACKET  --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- -
@@ -537,10 +717,9 @@ class FlagNumber {
 class PacketData {
 
     private final static byte PHOTO_COMMAND = 0x1;
-    private final static byte FIRMWARE_COMMAND = 0x1;
+    private final static byte FIRMWARE_COMMAND = 0x2;
 
     private final byte[] bytes;
-    private int length = -1;
 
     PacketData(byte[] data) {
         this.bytes = data;
@@ -732,6 +911,17 @@ class KarelPacket {
                 new AcknowledgeNumber(acknowledge[2], acknowledge[3]),
                 flag,
                 new PacketData(new byte[]{})
+        );
+    }
+
+    public static KarelPacket createDataPacket(ConnectionId connectionId, int pointer, byte[] data) {
+        byte[] sequence = Helpers.intToByteArray(pointer);
+        return new KarelPacket(
+                connectionId,
+                new SequenceNumber(sequence[2], sequence[3]),
+                new AcknowledgeNumber(0x0, 0x0),
+                new FlagNumber((byte) 0x0),
+                new PacketData(data)
         );
     }
 }
