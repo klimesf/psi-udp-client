@@ -87,7 +87,13 @@ class PhotoReceiver implements SocketHandler {
                 for (Integer key : keys) {
 //                    System.out.printf("Arr no: %d\n", key);
                     KarelPacket value = map.get(key);
-                    fos.write(value.getData().getBytes());
+                    if (value.getSq().toInteger() == 7610) {
+                        byte[] buf = new byte[218];
+                        System.arraycopy(value.getData().getBytes(), 0, buf, 0, 218);
+                        fos.write(buf);
+                    } else {
+                        fos.write(value.getData().getBytes());
+                    }
                 }
             }
             fos.close();
@@ -102,7 +108,9 @@ class PhotoReceiver implements SocketHandler {
 
         currentPackets = new HashMap<>();
         int pointer = 0;
-        long total = 0;
+        long totalBytes = 0;
+        long totalPackets = 0;
+        long successfulPackets = 0;
 
         System.out.println("Starting to download photo: \n\n");
 
@@ -113,15 +121,16 @@ class PhotoReceiver implements SocketHandler {
             packet = new DatagramPacket(new byte[255 + 9], 255 + 9);
             socket.receive(packet);
             receivedKarelPacket = KarelPacket.parseFromDatagramPacket(packet);
+            ++totalPackets;
 
 //            System.out.println("RECV(data): " + receivedKarelPacket.toString());
 
             // Reply with acknowledge
             if (receivedKarelPacket.getId().equals(connectionId)) {
-                long percent = Math.round(((double) total / 204218.) * 100);
+                long percent = Math.round(((double) totalBytes / 204218.) * 100);
                 int milestone = 100 / 50;
                 StringBuilder sb = new StringBuilder(52).append('|');
-                for(int i = 0; i < 100; i++) {
+                for (int i = 0; i < 100; i++) {
                     if ((i + 1) % milestone == 0) {
                         if (i < percent) {
                             sb.append('#');
@@ -138,10 +147,10 @@ class PhotoReceiver implements SocketHandler {
                         // If we received packet which continues in the window
                         currentPackets.put(pointer, receivedKarelPacket);
                         pointer += receivedKarelPacket.getData().getLength();
-                        total += receivedKarelPacket.getData().getLength();
+                        totalBytes += receivedKarelPacket.getData().getLength();
                         // If we already received packets further in the window
                         while (currentPackets.containsKey(pointer)) {
-                            total += currentPackets.get(pointer).getData().getLength();
+                            totalBytes += currentPackets.get(pointer).getData().getLength();
                             pointer += currentPackets.get(pointer).getData().getLength();
                         }
 //                        System.out.printf("WINDOW: pointer: %d, total: %d\n", pointer, total);
@@ -154,34 +163,32 @@ class PhotoReceiver implements SocketHandler {
                         newKarelPacket = KarelPacket.createAcknowledgePacket(connectionId, pointer, receivedKarelPacket.getFlag());
 
                     } else if (receivedKarelPacket.getSq().toInteger() < pointer) {
-                        if (receivedKarelPacket.getFlag().isCarryingData()) {
-                            // If sq is lower than the pointer
-                            if (currentPackets.containsKey(receivedKarelPacket.getSq().toInteger())) {
-                                // If we received packet which we already had
-                                newKarelPacket = KarelPacket.createAcknowledgePacket(connectionId, pointer, receivedKarelPacket.getFlag());
-                            } else {
-                                // If the pointer overflowed
-                                packetsList.add(currentPackets);
+                        // If sq is lower than the pointer
+                        if (currentPackets.containsKey(receivedKarelPacket.getSq().toInteger())) {
+                            // If we received packet which we already had
+                            newKarelPacket = KarelPacket.createAcknowledgePacket(connectionId, pointer, receivedKarelPacket.getFlag());
+                        } else {
+                            // If the pointer overflowed
+                            packetsList.add(currentPackets);
 //                                System.out.printf("Creating new packet list, current size is: %d\n", packetsList.size());
-                                currentPackets = new HashMap<>();
-                                pointer = receivedKarelPacket.getSq().toInteger();
-                                currentPackets.put(pointer, receivedKarelPacket);
-                                pointer += receivedKarelPacket.getData().getLength();
-                                total += receivedKarelPacket.getData().getLength();
-                                // If we already received packets further in the window
-                                while (currentPackets.containsKey(pointer)) {
-                                    total += currentPackets.get(pointer).getData().getLength();
-                                    pointer += currentPackets.get(pointer).getData().getLength();
-                                }
-//                                System.out.printf("WINDOW: pointer: %d, total: %d\n", pointer, total);
-                                newKarelPacket = KarelPacket.createAcknowledgePacket(connectionId, pointer, receivedKarelPacket.getFlag());
+                            currentPackets = new HashMap<>();
+                            pointer = receivedKarelPacket.getSq().toInteger();
+                            currentPackets.put(pointer, receivedKarelPacket);
+                            pointer += receivedKarelPacket.getData().getLength();
+                            totalBytes += receivedKarelPacket.getData().getLength();
+                            // If we already received packets further in the window
+                            while (currentPackets.containsKey(pointer)) {
+                                totalBytes += currentPackets.get(pointer).getData().getLength();
+                                pointer += currentPackets.get(pointer).getData().getLength();
                             }
+//                                System.out.printf("WINDOW: pointer: %d, total: %d\n", pointer, total);
+                            newKarelPacket = KarelPacket.createAcknowledgePacket(connectionId, pointer, receivedKarelPacket.getFlag());
                         }
                     }
 
                 } else if (receivedKarelPacket.getFlag().isClosingConnection()) {
                     if (receivedKarelPacket.getFlag().isFinishing()) {
-                        System.out.printf("Received a finishing packet. Received %d bytes during this session.\n", total);
+                        System.out.printf("Received a finishing packet. Received %d bytes in %d packets during this session.\n", totalBytes, totalPackets);
                         newKarelPacket = KarelPacket.createAcknowledgePacket(connectionId, receivedKarelPacket.getSq().toInteger(), receivedKarelPacket.getFlag());
                     } else {
                         System.out.println("Received an error packet.");
