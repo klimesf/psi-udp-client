@@ -181,7 +181,7 @@ class PhotoReceiver implements SocketHandler {
             if (Robot.verbose) {
                 System.out.println("Received packet which doesn't follow up, saving for further use.");
             }
-            ackKarelPacket = saveForFurtherUser(receivedKarelPacket);
+            ackKarelPacket = saveForFurtherUse(receivedKarelPacket);
 
         } else { // if (receivedKarelPacket.getSq().toInteger().compareTo(pointer) < 0) {
             // If sq is lower than the pointer
@@ -191,8 +191,7 @@ class PhotoReceiver implements SocketHandler {
             } else {
                 // If the pointer overflowed
                 receivedKeys = new HashSet<>();
-                pointer = receivedKarelPacket.getSq().toInteger();
-                ackKarelPacket = acceptPacket(receivedKarelPacket);
+                ackKarelPacket = saveForFurtherUse(receivedKarelPacket);
             }
         }
         return ackKarelPacket;
@@ -223,7 +222,7 @@ class PhotoReceiver implements SocketHandler {
      * @param receivedKarelPacket The received KarelPacket.
      * @return The KarelPacket which acknowledges the server about the current state.
      */
-    private KarelPacket saveForFurtherUser(KarelPacket receivedKarelPacket) {
+    private KarelPacket saveForFurtherUse(KarelPacket receivedKarelPacket) {
         KarelPacket ackKarelPacket;
         windowPackets.put(receivedKarelPacket.getSq().toInteger(), receivedKarelPacket);
         receivedKeys.add(receivedKarelPacket.getSq().toInteger());
@@ -243,7 +242,7 @@ class PhotoReceiver implements SocketHandler {
         KarelPacket ackKarelPacket;
         fos.write(receivedKarelPacket.getData().getBytes());
         receivedKeys.add(receivedKarelPacket.getSq().toInteger());
-        pointer += receivedKarelPacket.getData().getLength();
+        addToPointer(receivedKarelPacket.getData().getLength());
         totalBytes += receivedKarelPacket.getData().getLength();
         ++successfulPackets;
         // If we already received packets further in the window
@@ -252,7 +251,7 @@ class PhotoReceiver implements SocketHandler {
             windowPackets.remove(pointer);
             fos.write(next.getData().getBytes());
             totalBytes += next.getData().getLength();
-            pointer += next.getData().getLength();
+            addToPointer(next.getData().getLength());
             ++successfulPackets;
         }
         if (Robot.verbose) {
@@ -260,6 +259,11 @@ class PhotoReceiver implements SocketHandler {
         }
         ackKarelPacket = KarelPacket.createAcknowledgePacket(connectionId, pointer, receivedKarelPacket.getFlag());
         return ackKarelPacket;
+    }
+
+    private void addToPointer(int length) {
+        pointer += length;
+        pointer = (new Integer(pointer).shortValue()) & 0xffff;
     }
 
     /**
@@ -368,13 +372,9 @@ class PhotoReceiver implements SocketHandler {
  * @author klimesf
  */
 class Helpers {
-    public static Integer byteArrayToInt(byte[] bytes) {
-        Integer value = new BigInteger(bytes).intValue();
-        if (value < 0) {
-            value = value & 0x0000ffff;
-            return value;
-        }
-        return value;
+    public static Integer byteArrayToInteger(byte[] bytes) {
+        Short value = new BigInteger(bytes).shortValue();
+        return value & 0xffff;
     }
 
     public static byte[] intToByteArray(int value) {
@@ -399,11 +399,11 @@ abstract class TwoByteNumber {
 
     @Override
     public String toString() {
-        return Helpers.byteArrayToInt(bytes).toString();
+        return Helpers.byteArrayToInteger(bytes).toString();
     }
 
     public Integer toInteger() {
-        return Helpers.byteArrayToInt(bytes);
+        return Helpers.byteArrayToInteger(bytes);
     }
 }
 
