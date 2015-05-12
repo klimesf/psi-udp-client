@@ -24,6 +24,7 @@ public class Robot {
 
     public static final int PORT_TO = 4000;
     public static final int PORT_FROM = 4000;
+    public static boolean verbose = false;
 
     public static void main(String[] args) throws Exception {
         DatagramSocket socket;
@@ -31,6 +32,13 @@ public class Robot {
         int fromPort = Robot.PORT_FROM, portTo = Robot.PORT_TO;
         socket = new DatagramSocket(fromPort);
         address = InetAddress.getByName(args[0]);
+
+        for (String val : args) {
+            if (val.equals("-v")) {
+                Robot.verbose = true;
+                break;
+            }
+        }
 
         System.out.printf("Connecting to server %s:%s\n", args[0], portTo);
 
@@ -57,65 +65,44 @@ class PhotoReceiver implements SocketHandler {
     private final DatagramSocket socket;
     private final InetAddress address;
     private final Integer port;
+    private final FileOutputStream fos;
     private ConnectionId connectionId;
-    private final List<Map<Integer, KarelPacket>> packetsList = new LinkedList<>();
-    private Map<Integer, KarelPacket> currentPackets;
+    private Map<Integer, KarelPacket> windowPackets = new HashMap<>();
+    private int pointer;
+    private Long totalBytes;
+    private Long totalPackets;
+    private Long successfulPackets;
+    private Set<Integer> receivedKeys = new HashSet<>();
 
-    PhotoReceiver(DatagramSocket socket, InetAddress address, Integer port) {
+    PhotoReceiver(DatagramSocket socket, InetAddress address, Integer port) throws FileNotFoundException {
         this.socket = socket;
         this.address = address;
         this.port = port;
+        fos = new FileOutputStream("foto.png");
+        pointer = 0;
+        totalBytes = (long) 0;
+        totalPackets = (long) 0;
+        successfulPackets = (long) 0;
     }
 
+    /**
+     * @throws IOException
+     * @throws CorruptedPacketException
+     */
     public void handle() throws IOException, CorruptedPacketException {
         this.openConnection();
         this.receiveData();
-        this.savePhoto();
-    }
-
-    private void savePhoto() throws FileNotFoundException {
-        packetsList.add(currentPackets); // Last currentPackets hasn't been added
-        System.out.println("Saving photo to \"foto.png.\"");
-        int i = 0;
-        try {
-            FileOutputStream fos = new FileOutputStream("foto.png");
-            Iterator<Map<Integer, KarelPacket>> it = packetsList.iterator();
-            while (it.hasNext()) {
-//                System.out.printf("List no: %d\n", ++i);
-                Map<Integer, KarelPacket> map = it.next();
-                SortedSet<Integer> keys = new TreeSet<>(map.keySet());
-                for (Integer key : keys) {
-//                    System.out.printf("Arr no: %d\n", key);
-                    KarelPacket value = map.get(key);
-                    if (value.getSq().toInteger() == 7610) {
-                        byte[] buf = new byte[218];
-                        System.arraycopy(value.getData().getBytes(), 0, buf, 0, 218);
-                        fos.write(buf);
-                    } else {
-                        fos.write(value.getData().getBytes());
-                    }
-                }
-            }
-            fos.close();
-        } catch (IOException e) {
-        }
-        System.out.println("Photo saved.");
+        this.fos.close();
     }
 
     private void receiveData() throws IOException, CorruptedPacketException {
         DatagramPacket packet;
-        KarelPacket receivedKarelPacket, newKarelPacket;
-
-        currentPackets = new HashMap<>();
-        int pointer = 0;
-        long totalBytes = 0;
-        long totalPackets = 0;
-        long successfulPackets = 0;
+        KarelPacket receivedKarelPacket, ackKarelPacket;
 
         System.out.println("Starting to download photo: \n\n");
 
         while (!socket.isClosed()) {
-            newKarelPacket = null; // Reset new packet
+            ackKarelPacket = null; // Reset new packet
 
             // Receive reply with data
             packet = new DatagramPacket(new byte[255 + 9], 255 + 9);
@@ -123,93 +110,76 @@ class PhotoReceiver implements SocketHandler {
             receivedKarelPacket = KarelPacket.parseFromDatagramPacket(packet);
             ++totalPackets;
 
-//            System.out.println("RECV(data): " + receivedKarelPacket.toString());
+            if (Robot.verbose) {
+                System.out.println("RECV(data): " + receivedKarelPacket.toString());
+            }
 
             // Reply with acknowledge
             if (receivedKarelPacket.getId().equals(connectionId)) {
-                long percent = Math.round(((double) totalBytes / 204218.) * 100);
-                int milestone = 100 / 50;
-                StringBuilder sb = new StringBuilder(52).append('|');
-                for (int i = 0; i < 100; i++) {
-                    if ((i + 1) % milestone == 0) {
-                        if (i < percent) {
-                            sb.append('#');
-                        } else {
-                            sb.append(' ');
+
+                if (!Robot.verbose) {
+                    long percent = Math.round(((double) totalBytes / 204218.) * 100);
+                    int milestone = 100 / 50;
+                    StringBuilder sb = new StringBuilder(52).append('|');
+                    for (int i = 0; i < 100; i++) {
+                        if ((i + 1) % milestone == 0) {
+                            if (i < percent) {
+                                sb.append('#');
+                            } else {
+                                sb.append(' ');
+                            }
                         }
                     }
+                    sb.append('|');
+                    System.out.printf("%3d%% %s\n", percent, sb.toString());
                 }
-                sb.append('|');
-                System.out.printf("%3d%% %s\n", percent, sb.toString());
+
+                int pointerBefore = pointer;
 
                 if (receivedKarelPacket.getFlag().isCarryingData()) {
-                    if (receivedKarelPacket.getSq().toInteger() == pointer) {
+                    if (receivedKarelPacket.getSq().toInteger().equals(pointer)) {
                         // If we received packet which continues in the window
-                        currentPackets.put(pointer, receivedKarelPacket);
-                        pointer += receivedKarelPacket.getData().getLength();
-                        totalBytes += receivedKarelPacket.getData().getLength();
-                        // If we already received packets further in the window
-                        while (currentPackets.containsKey(pointer)) {
-                            totalBytes += currentPackets.get(pointer).getData().getLength();
-                            pointer += currentPackets.get(pointer).getData().getLength();
-                        }
-//                        System.out.printf("WINDOW: pointer: %d, total: %d\n", pointer, total);
-                        newKarelPacket = KarelPacket.createAcknowledgePacket(connectionId, pointer, receivedKarelPacket.getFlag());
+                        ackKarelPacket = acceptPacket(receivedKarelPacket);
 
-                    } else if (receivedKarelPacket.getSq().toInteger() > pointer) {
+                    } else if (receivedKarelPacket.getSq().toInteger().compareTo(pointer) > 0) {
                         // If we received packet which is further in line than the pointer
-//                    System.out.println("Received packet which doesn't follow up, saving for further use.");
-                        currentPackets.put(receivedKarelPacket.getSq().toInteger(), receivedKarelPacket);
-                        newKarelPacket = KarelPacket.createAcknowledgePacket(connectionId, pointer, receivedKarelPacket.getFlag());
+                        if (Robot.verbose) {
+                            System.out.println("Received packet which doesn't follow up, saving for further use.");
+                        }
+                        ackKarelPacket = saveForFurtherUser(receivedKarelPacket);
 
-                    } else if (receivedKarelPacket.getSq().toInteger() < pointer) {
+                    } else { // if (receivedKarelPacket.getSq().toInteger().compareTo(pointer) < 0) {
                         // If sq is lower than the pointer
-                        if (currentPackets.containsKey(receivedKarelPacket.getSq().toInteger())) {
+                        if (receivedKeys.contains(receivedKarelPacket.getSq().toInteger())) {
                             // If we received packet which we already had
-                            newKarelPacket = KarelPacket.createAcknowledgePacket(connectionId, pointer, receivedKarelPacket.getFlag());
+                            ackKarelPacket = KarelPacket.createAcknowledgePacket(connectionId, pointer, receivedKarelPacket.getFlag());
                         } else {
                             // If the pointer overflowed
-                            packetsList.add(currentPackets);
-//                                System.out.printf("Creating new packet list, current size is: %d\n", packetsList.size());
-                            currentPackets = new HashMap<>();
+                            receivedKeys = new HashSet<>();
                             pointer = receivedKarelPacket.getSq().toInteger();
-                            currentPackets.put(pointer, receivedKarelPacket);
-                            pointer += receivedKarelPacket.getData().getLength();
-                            totalBytes += receivedKarelPacket.getData().getLength();
-                            // If we already received packets further in the window
-                            while (currentPackets.containsKey(pointer)) {
-                                totalBytes += currentPackets.get(pointer).getData().getLength();
-                                pointer += currentPackets.get(pointer).getData().getLength();
-                            }
-//                                System.out.printf("WINDOW: pointer: %d, total: %d\n", pointer, total);
-                            newKarelPacket = KarelPacket.createAcknowledgePacket(connectionId, pointer, receivedKarelPacket.getFlag());
+                            ackKarelPacket = acceptPacket(receivedKarelPacket);
                         }
                     }
 
                 } else if (receivedKarelPacket.getFlag().isClosingConnection()) {
                     if (receivedKarelPacket.getFlag().isFinishing()) {
-                        System.out.printf("Received a finishing packet. Received %d bytes in %d packets during this session.\n", totalBytes, totalPackets);
-                        newKarelPacket = KarelPacket.createAcknowledgePacket(connectionId, receivedKarelPacket.getSq().toInteger(), receivedKarelPacket.getFlag());
+                        System.out.printf("Received a finishing packet. Received %d bytes in %d successful of %d total packets during this session.\n", totalBytes, successfulPackets, totalPackets);
+                        ackKarelPacket = KarelPacket.createAcknowledgePacket(connectionId, receivedKarelPacket.getSq().toInteger(), receivedKarelPacket.getFlag());
                     } else {
                         System.out.println("Received an error packet.");
                     }
+                } else {
+                    throw new RuntimeException("Unknown type of packet.");
                 }
+
+                // Shit happens, I would love to know why
+                if (pointer < pointerBefore && pointerBefore < 60000) {
+                    throw new RuntimeException("LOLWUT");
+                }
+
                 // Send acknowledge packet
-                if (newKarelPacket != null) {
-                    // Else, if we should send ack packet, send it
-                    if (newKarelPacket.getAck().toInteger() == 7647) {
-                        byte[] ack = Helpers.intToByteArray(7610);
-                        newKarelPacket = KarelPacket.createPacket(
-                                newKarelPacket.getId(),
-                                newKarelPacket.getSq(),
-                                new AcknowledgeNumber(ack[2], ack[3]),
-                                newKarelPacket.getFlag(),
-                                new PacketData(new byte[]{})
-                        );
-                    }
-                    packet = newKarelPacket.createDatagramPacket(address, port);
-                    socket.send(packet);
-//                    System.out.println("SEND(ack): " + newKarelPacket.toString());
+                if (ackKarelPacket != null) {
+                    sendAcknowledgePacket(ackKarelPacket);
                 }
 
                 // If we received closing flag packet, shutdown the connection
@@ -218,7 +188,69 @@ class PhotoReceiver implements SocketHandler {
                     socket.close();
                     break;
                 }
+            } else {
+                System.out.println("RECV wrong connection id");
             }
+        }
+    }
+
+    /**
+     * Saves packet for further user and creates correct acknowledge packet.
+     *
+     * @param receivedKarelPacket The received KarelPacket.
+     * @return The KarelPacket which acknowledges the server about the current state.
+     */
+    private KarelPacket saveForFurtherUser(KarelPacket receivedKarelPacket) {
+        KarelPacket ackKarelPacket;
+        windowPackets.put(receivedKarelPacket.getSq().toInteger(), receivedKarelPacket);
+        receivedKeys.add(receivedKarelPacket.getSq().toInteger());
+        ackKarelPacket = KarelPacket.createAcknowledgePacket(connectionId, pointer, receivedKarelPacket.getFlag());
+        return ackKarelPacket;
+    }
+
+    /**
+     * Accepts KarelPacket, saves its data to a file, iterates over previously stored packets and creates a correct
+     * acknowledge packet.
+     *
+     * @param receivedKarelPacket The received KarelPacket.
+     * @return The KarelPacket which acknowledges the server about the current state.
+     * @throws IOException
+     */
+    private KarelPacket acceptPacket(KarelPacket receivedKarelPacket) throws IOException {
+        KarelPacket ackKarelPacket;
+        fos.write(receivedKarelPacket.getData().getBytes());
+        receivedKeys.add(receivedKarelPacket.getSq().toInteger());
+        pointer += receivedKarelPacket.getData().getLength();
+        totalBytes += receivedKarelPacket.getData().getLength();
+        ++successfulPackets;
+        // If we already received packets further in the window
+        while (windowPackets.containsKey(pointer)) {
+            KarelPacket next = windowPackets.get(pointer);
+            windowPackets.remove(pointer);
+            fos.write(next.getData().getBytes());
+            totalBytes += next.getData().getLength();
+            pointer += next.getData().getLength();
+            ++successfulPackets;
+        }
+        if (Robot.verbose) {
+            System.out.printf("WINDOW: pointer: %d, total: %d\n", pointer, totalBytes);
+        }
+        ackKarelPacket = KarelPacket.createAcknowledgePacket(connectionId, pointer, receivedKarelPacket.getFlag());
+        return ackKarelPacket;
+    }
+
+    /**
+     * Sends given acknowledge packet.
+     *
+     * @param ackKarelPacket The acknowledge packet to be sent.
+     * @throws IOException
+     */
+    private void sendAcknowledgePacket(KarelPacket ackKarelPacket) throws IOException {
+        DatagramPacket packet;// Else, if we should send ack packet, send it
+        packet = ackKarelPacket.createDatagramPacket(address, port);
+        socket.send(packet);
+        if (Robot.verbose) {
+            System.out.println("SEND(ack): " + ackKarelPacket.toString());
         }
     }
 
@@ -275,7 +307,9 @@ class PhotoReceiver implements SocketHandler {
         karelPacket = KarelPacket.createOpeningPacket(PacketData.createPhotoCommand());
         packet = karelPacket.createDatagramPacket(address, port);
         socket.send(packet);
-//        System.out.println("SEND(init): " + karelPacket.toString());
+        if (Robot.verbose) {
+            System.out.println("SEND(init): " + karelPacket.toString());
+        }
     }
 
     private void receiveInitPacket(DatagramSocket socket) throws CorruptedPacketException, IOException {
@@ -286,10 +320,14 @@ class PhotoReceiver implements SocketHandler {
 
         if (karelPacket.getFlag().isOpening()) {
             connectionId = karelPacket.getId();
-//            System.out.println("RECV(init): " + karelPacket.toString());
+            if (Robot.verbose) {
+                System.out.println("RECV(init): " + karelPacket.toString());
+            }
             System.out.printf("Opened connection with id %s.\n", connectionId.toString());
         } else if (karelPacket.getFlag().isCarryingData()) {
-//            System.out.println("RECV(init): rubbish");
+            if (Robot.verbose) {
+                System.out.println("RECV(init): rubbish");
+            }
         }
     }
 }
@@ -484,23 +522,6 @@ class PacketData {
     }
 
     public int getLength() {
-//        if (length < 0) {
-//            if (bytes == null || bytes.length < 1) {
-//                length = 0;
-//            }
-//            int i = bytes.length - 1;
-//            while (i > 0) {
-//                if (bytes[i] == 0) {
-//                    continue;
-//                } else {
-//                    break;
-//                }
-//            }
-//            if (length > 240) length = 255; // Correction?
-//            length = i + 1;
-//        }
-//        return length;
-
         return bytes != null && bytes.length > 0 ? bytes.length : 0;
     }
 
@@ -517,8 +538,15 @@ class PacketData {
     }
 
     public static PacketData parseFromDatagramPacket(DatagramPacket packet) {
-        byte[] buf = new byte[packet.getData().length - 9];
-        System.arraycopy(packet.getData(), 0, buf, 0, packet.getData().length - 9);
+        ByteBuffer bf = ByteBuffer.wrap(packet.getData());
+        bf.getInt();
+        bf.getShort();
+        bf.getShort();
+        bf.get();
+        byte[] buf = new byte[packet.getLength() - 9];
+        for (int i = 0; i < buf.length; i++) {
+            buf[i] = bf.get();
+        }
         return new PacketData(buf);
     }
 }
