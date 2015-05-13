@@ -350,11 +350,11 @@ class PhotoReceiver implements SocketHandler {
 
     private void receiveInitPacket(DatagramSocket socket) throws CorruptedPacketException, IOException {
         // Receive reply with connection id
-        DatagramPacket packet = new DatagramPacket(new byte[9], 9);
+        DatagramPacket packet = new DatagramPacket(new byte[10], 10);
         socket.receive(packet);
         KarelPacket karelPacket = KarelPacket.parseFromDatagramPacket(packet);
 
-        if (karelPacket.getFlag().isOpening()) {
+        if (karelPacket.getFlag().isOpening() && karelPacket.getData().getBytes()[0] == 0x1) {
             connectionId = karelPacket.getId();
             if (Robot.verbose) {
                 System.out.println("RECV(init): " + karelPacket.toString());
@@ -376,7 +376,10 @@ class FirmwareUploader implements SocketHandler {
     private final FileInputStream fis;
     private ConnectionId connectionId;
     private int pointer = 0;
+    private long totalBytes = 0;
     private Map<Integer, KarelPacket> window = new HashMap<>();
+    private Map<Integer, Integer> timesSentMap = new HashMap<>();
+    private boolean finReceived = false;
 
     public FirmwareUploader(DatagramSocket socket, InetAddress address, int port, String firmwareFileName) throws IOException {
         this.socket = socket;
@@ -400,51 +403,103 @@ class FirmwareUploader implements SocketHandler {
     }
 
     private void processStream() throws CorruptedPacketException, IOException {
-        DatagramPacket packet;
         while (!socket.isClosed()) {
-            packet = new DatagramPacket(new byte[255], 255);
-            socket.receive(packet);
-            KarelPacket receivedKarelPacket = KarelPacket.parseFromDatagramPacket(packet);
-            if (receivedKarelPacket.getFlag().isCarryingData()) {
-                pointer = receivedKarelPacket.getAck().toInteger();
-                if (Robot.verbose) {
-                    System.out.println("RECV " + receivedKarelPacket.toString());
-                }
-
-                this.fillWindow(pointer);
-                KarelPacket toSend = window.get(pointer);
-                packet = toSend.createDatagramPacket(address, port);
-                socket.send(packet);
-                if (Robot.verbose) {
-                    System.out.println("SEND " + toSend.toString());
-                }
+            ExecutorService executorService = Executors.newSingleThreadExecutor();
+            Future futureResult = executorService.submit(new AcknowledgePacketReceiver(this));
+            KarelPacket toSend = this.sendDataPacket(pointer);
+            try {
+                futureResult.get(100, TimeUnit.MILLISECONDS);
+            } catch (CancellationException e) {
+            } catch (InterruptedException e) {
+            } catch (ExecutionException e) {
+            } catch (TimeoutException e) {
+                futureResult.cancel(true);
             }
+
+            if (toSend.getData().getLength() < 255 && pointer == toSend.getSq().toInteger()) {
+                int finPacketSentTimes = 0;
+                while (!finReceived && finPacketSentTimes < 21) {
+                    ExecutorService executorService2 = Executors.newSingleThreadExecutor();
+                    Future futureResult2 = executorService.submit(new FinPacketReceiver(this));
+                    finPacketSentTimes++;
+                    this.sendFinishingPacket();
+                    try {
+                        futureResult2.get(100, TimeUnit.MILLISECONDS);
+                    } catch (CancellationException e) {
+                    } catch (InterruptedException e) {
+                    } catch (ExecutionException e) {
+                    } catch (TimeoutException e) {
+                        futureResult2.cancel(true);
+                    }
+                    executorService2.shutdown();
+                }
+                System.out.printf("Closing socket because finReceived:%b or finPacketSentTimes:%d\n", finReceived, finPacketSentTimes);
+                System.out.printf("Total bytes: %d", totalBytes);
+                this.socket.close();
+            }
+
+            executorService.shutdown();
         }
     }
 
-    private void sendWindow() throws IOException {
-        int kunda = pointer;
-        for (int i = 0; i < 8; i++) {
-            KarelPacket toSend = window.get(kunda);
-            kunda = addToKunda(toSend.getData().getLength(), kunda);
+    private KarelPacket sendFinishingPacket() throws IOException {
+        KarelPacket toSend = KarelPacket.createFinishingPacket(connectionId, pointer);
+        DatagramPacket packet = toSend.createDatagramPacket(address, port);
+        socket.send(packet);
+        if (Robot.verbose) {
+            System.out.println("SEND(fin) " + toSend.toString());
+        }
+        return toSend;
+    }
+
+    private KarelPacket sendDataPacket(int pointer) throws IOException {
+        int timesSent = timesSentMap.get(pointer) != null ? timesSentMap.get(pointer) : 0;
+        if (timesSent >= 20) {
+            KarelPacket toSend = KarelPacket.createRSTPacket(connectionId);
             DatagramPacket packet = toSend.createDatagramPacket(address, port);
             socket.send(packet);
+            socket.close();
 
             if (Robot.verbose) {
                 System.out.println("SEND(data) " + toSend.toString());
             }
+            return toSend;
+        } else {
+            KarelPacket toSend = window.get(pointer);
+            DatagramPacket packet = toSend.createDatagramPacket(address, port);
+            socket.send(packet);
+
+            if (timesSentMap.containsKey(pointer)) {
+                timesSentMap.replace(pointer, timesSent + 1);
+            } else {
+                timesSentMap.put(pointer, timesSent + 1);
+            }
+
+            if (Robot.verbose) {
+                System.out.println("SEND " + toSend.toString());
+            }
+
+            return toSend;
+        }
+    }
+
+    private void sendWindow() throws IOException {
+        int iterator = pointer;
+        for (int i = 0; i < 8; i++) {
+            KarelPacket toSend = this.sendDataPacket(iterator);
+            iterator = addToIterator(toSend.getData().getLength(), iterator);
         }
     }
 
     private void fillWindow(int pointer) throws IOException {
-        int kunda = pointer;
+        int interator = pointer;
         for (int i = 0; i < 8; i++) {
-            if (window.containsKey(kunda)) {
+            if (window.containsKey(interator)) {
                 continue;
             }
-            KarelPacket newPacket = this.createDataPacket(kunda);
-            window.put(kunda, newPacket);
-            kunda = addToKunda(newPacket.getData().getLength(), kunda);
+            KarelPacket newPacket = this.createDataPacket(interator);
+            window.put(interator, newPacket);
+            interator = addToIterator(newPacket.getData().getLength(), interator);
         }
     }
 
@@ -498,6 +553,62 @@ class FirmwareUploader implements SocketHandler {
         }
     }
 
+    private class AcknowledgePacketReceiver implements Runnable {
+        private FirmwareUploader parent;
+
+        public AcknowledgePacketReceiver(FirmwareUploader parent) {
+            this.parent = parent;
+        }
+
+        @Override
+        public void run() {
+            try {
+                DatagramPacket packet;
+                while (!socket.isClosed()) {
+                    packet = new DatagramPacket(new byte[9], 9);
+                    socket.receive(packet);
+                    KarelPacket receivedKarelPacket = KarelPacket.parseFromDatagramPacket(packet);
+                    if (receivedKarelPacket.getFlag().isCarryingData()) {
+                        pointer = receivedKarelPacket.getAck().toInteger();
+                        if (Robot.verbose) {
+                            System.out.println("RECV(ack) " + receivedKarelPacket.toString());
+                        }
+
+                        parent.fillWindow(pointer);
+                        parent.sendDataPacket(pointer);
+                    }
+                }
+            } catch (CorruptedPacketException e) {
+            } catch (IOException e) {
+            }
+        }
+    }
+
+    private class FinPacketReceiver implements Runnable {
+        private FirmwareUploader parent;
+
+        public FinPacketReceiver(FirmwareUploader parent) {
+            this.parent = parent;
+        }
+
+        @Override
+        public void run() {
+            try {
+                DatagramPacket packet;
+                while (!socket.isClosed()) {
+                    packet = new DatagramPacket(new byte[9], 9);
+                    socket.receive(packet);
+                    KarelPacket receivedKarelPacket = KarelPacket.parseFromDatagramPacket(packet);
+                    if (receivedKarelPacket.getFlag().isFinishing()) {
+                        parent.finReceived = true;
+                    }
+                }
+            } catch (CorruptedPacketException e) {
+            } catch (IOException e) {
+            }
+        }
+    }
+
     private void sendInitPacket(DatagramSocket socket, InetAddress address, Integer port) throws IOException {
         KarelPacket karelPacket;
         DatagramPacket packet;
@@ -517,7 +628,7 @@ class FirmwareUploader implements SocketHandler {
         socket.receive(packet);
         KarelPacket karelPacket = KarelPacket.parseFromDatagramPacket(packet);
 
-        if (karelPacket.getFlag().isOpening()) {
+        if (karelPacket.getFlag().isOpening()) { //  && karelPacket.getData().getBytes()[0] == 0x2
             connectionId = karelPacket.getId();
             if (Robot.verbose) {
                 System.out.println("RECV(init): " + karelPacket.toString());
@@ -530,15 +641,10 @@ class FirmwareUploader implements SocketHandler {
         }
     }
 
-    private void addToPointer(int length) {
-        pointer += length;
-        pointer = (new Integer(pointer).shortValue()) & 0xffff;
-    }
-
-    private int addToKunda(int length, int kunda) {
-        kunda += length;
-        kunda = (new Integer(kunda).shortValue()) & 0xffff;
-        return kunda;
+    private int addToIterator(int length, int iterator) {
+        iterator += length;
+        iterator = (new Integer(iterator).shortValue()) & 0xffff;
+        return iterator;
     }
 }
 
@@ -922,6 +1028,27 @@ class KarelPacket {
                 new AcknowledgeNumber(0x0, 0x0),
                 new FlagNumber((byte) 0x0),
                 new PacketData(data)
+        );
+    }
+
+    public static KarelPacket createRSTPacket(ConnectionId id) {
+        return new KarelPacket(
+                id,
+                new SequenceNumber(0, 0),
+                new AcknowledgeNumber(0, 0),
+                FlagNumber.createCancelFlag(),
+                new PacketData(new byte[]{0x0})
+        );
+    }
+
+    public static KarelPacket createFinishingPacket(ConnectionId id, int pointer) {
+        byte[] sequence = Helpers.intToByteArray(pointer);
+        return new KarelPacket(
+                id,
+                new SequenceNumber(sequence[2], sequence[3]),
+                new AcknowledgeNumber(0, 0),
+                FlagNumber.createFinishingFlag(),
+                new PacketData(new byte[]{})
         );
     }
 }
