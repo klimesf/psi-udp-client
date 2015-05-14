@@ -187,10 +187,15 @@ class PhotoReceiver implements SocketHandler {
 
         } else if (receivedKarelPacket.getSq().toInteger().compareTo(pointer) > 0) {
             // If we received packet which is further in line than the pointer
-            if (Robot.verbose) {
-                System.out.println("Received packet which doesn't follow up, saving for further use.");
+            if (receivedKarelPacket.getSq().toInteger() > pointer + 2040) {
+                System.out.println("Received packet which doesn't follow up and is out of bounds of the window.");
+                ackKarelPacket = null;
+            } else {
+                if (Robot.verbose) {
+                    System.out.println("Received packet which doesn't follow up, saving for further use.");
+                }
+                ackKarelPacket = saveForFurtherUse(receivedKarelPacket);
             }
-            ackKarelPacket = saveForFurtherUse(receivedKarelPacket);
 
         } else { // if (receivedKarelPacket.getSq().toInteger().compareTo(pointer) < 0) {
             // If sq is lower than the pointer
@@ -199,8 +204,14 @@ class PhotoReceiver implements SocketHandler {
                 ackKarelPacket = KarelPacket.createAcknowledgePacket(connectionId, pointer, receivedKarelPacket.getFlag());
             } else {
                 // If the pointer overflowed
-                receivedKeys = new HashSet<>();
-                ackKarelPacket = saveForFurtherUse(receivedKarelPacket);
+
+                if (receivedKarelPacket.getSq().toInteger() > (new Integer(pointer + 2040).shortValue() & 0xffff)) {
+                    System.out.println("Received packet which doesn't follow up and is out of bounds of the window.");
+                    ackKarelPacket = null;
+                } else {
+                    receivedKeys = new HashSet<>();
+                    ackKarelPacket = saveForFurtherUse(receivedKarelPacket);
+                }
             }
         }
         return ackKarelPacket;
