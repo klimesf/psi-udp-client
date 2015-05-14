@@ -98,7 +98,9 @@ class PhotoReceiver implements SocketHandler {
      */
     public void handle() throws IOException, CorruptedPacketException {
         this.openConnection();
-        this.receiveData();
+        if (connectionId != null) {
+            this.receiveData();
+        }
         this.fos.close();
     }
 
@@ -299,8 +301,10 @@ class PhotoReceiver implements SocketHandler {
     private void openConnection() throws IOException, CorruptedPacketException {
         ExecutorService executorService = Executors.newSingleThreadExecutor();
         Future futureResult = executorService.submit(new InitPacketReceiver(this));
-        while (connectionId == null) {
+        int timesSent = 0;
+        while (!socket.isClosed() && connectionId == null && timesSent < 20) {
             this.sendInitPacket(socket, address, port);
+            ++timesSent;
             try {
                 futureResult.get(100, TimeUnit.MILLISECONDS);
             } catch (CancellationException e) {
@@ -312,8 +316,14 @@ class PhotoReceiver implements SocketHandler {
                 }
             }
         }
+
+        if (timesSent >= 20) {
+            socket.close();
+            System.out.printf("Could not connect to Karel on %s:%d\n", address.getHostAddress(), port);
+        }
         futureResult.cancel(true);
         executorService.shutdown();
+
     }
 
     private class InitPacketReceiver implements Runnable {
@@ -342,9 +352,11 @@ class PhotoReceiver implements SocketHandler {
         // Send init packet
         karelPacket = KarelPacket.createOpeningPacket(PacketData.createPhotoCommand());
         packet = karelPacket.createDatagramPacket(address, port);
-        socket.send(packet);
-        if (Robot.verbose) {
-            System.out.println("SEND(init): " + karelPacket.toString());
+        if (!socket.isClosed()) {
+            socket.send(packet);
+            if (Robot.verbose) {
+                System.out.println("SEND(init): " + karelPacket.toString());
+            }
         }
     }
 
@@ -380,6 +392,7 @@ class FirmwareUploader implements SocketHandler {
     private Map<Integer, KarelPacket> window = new HashMap<>();
     private Map<Integer, Integer> timesSentMap = new HashMap<>();
     private boolean finReceived = false;
+    private boolean rstReceived = false;
 
     public FirmwareUploader(DatagramSocket socket, InetAddress address, int port, String firmwareFileName) throws IOException {
         this.socket = socket;
@@ -391,7 +404,9 @@ class FirmwareUploader implements SocketHandler {
     @Override
     public void handle() throws IOException, CorruptedPacketException {
         this.openConnection();
-        this.sendData();
+        if (connectionId != null) {
+            this.sendData();
+        }
         fis.close();
     }
 
@@ -418,11 +433,13 @@ class FirmwareUploader implements SocketHandler {
 
             if (toSend.getData().getLength() < 255 && pointer == toSend.getSq().toInteger()) {
                 int finPacketSentTimes = 0;
-                while (!finReceived && finPacketSentTimes < 21) {
+                while (!socket.isClosed() && !finReceived && finPacketSentTimes < 21 && !rstReceived) {
                     ExecutorService executorService2 = Executors.newSingleThreadExecutor();
                     Future futureResult2 = executorService.submit(new FinPacketReceiver(this));
                     finPacketSentTimes++;
-                    this.sendFinishingPacket();
+                    if (!this.socket.isClosed()) {
+                        this.sendFinishingPacket();
+                    }
                     try {
                         futureResult2.get(100, TimeUnit.MILLISECONDS);
                     } catch (CancellationException e) {
@@ -433,7 +450,7 @@ class FirmwareUploader implements SocketHandler {
                     }
                     executorService2.shutdown();
                 }
-                System.out.printf("Closing socket because finReceived:%b or finPacketSentTimes:%d\n", finReceived, finPacketSentTimes);
+                System.out.printf("Closing socket because finReceived:%b or rstReceived:%b or finPacketSentTimes:%d\n", finReceived, rstReceived, finPacketSentTimes);
                 System.out.printf("Total bytes: %d", totalBytes);
                 this.socket.close();
             }
@@ -463,6 +480,9 @@ class FirmwareUploader implements SocketHandler {
             if (Robot.verbose) {
                 System.out.println("SEND(data) " + toSend.toString());
             }
+
+            System.out.printf("Closing connection because packet seq=%d was sent more than 20 times.\n", pointer);
+
             return toSend;
         } else {
             KarelPacket toSend = window.get(pointer);
@@ -517,8 +537,10 @@ class FirmwareUploader implements SocketHandler {
     private void openConnection() throws IOException {
         ExecutorService executorService = Executors.newSingleThreadExecutor();
         Future futureResult = executorService.submit(new InitPacketReceiver(this));
-        while (connectionId == null) {
+        int timesSent = 0;
+        while (!socket.isClosed() && connectionId == null && timesSent < 21) {
             this.sendInitPacket(socket, address, port);
+            ++timesSent;
             try {
                 futureResult.get(100, TimeUnit.MILLISECONDS);
             } catch (CancellationException e) {
@@ -530,8 +552,14 @@ class FirmwareUploader implements SocketHandler {
                 }
             }
         }
+
+        if (timesSent >= 20) {
+            socket.close();
+            System.out.printf("Could not connect to Karel on %s:%d\n", address.getHostAddress(), port);
+        }
         futureResult.cancel(true);
         executorService.shutdown();
+
     }
 
     private class InitPacketReceiver implements Runnable {
@@ -568,6 +596,11 @@ class FirmwareUploader implements SocketHandler {
                     packet = new DatagramPacket(new byte[9], 9);
                     socket.receive(packet);
                     KarelPacket receivedKarelPacket = KarelPacket.parseFromDatagramPacket(packet);
+
+                    if (!receivedKarelPacket.getId().equals(connectionId)) {
+                        continue;
+                    }
+
                     if (receivedKarelPacket.getFlag().isCarryingData()) {
                         pointer = receivedKarelPacket.getAck().toInteger();
                         if (Robot.verbose) {
@@ -576,6 +609,13 @@ class FirmwareUploader implements SocketHandler {
 
                         parent.fillWindow(pointer);
                         parent.sendDataPacket(pointer);
+                    } else if (receivedKarelPacket.getFlag().isCancel()) {
+                        parent.rstReceived = true;
+                        if (Robot.verbose) {
+                            System.out.println("RECV(rst) " + receivedKarelPacket.toString());
+                        }
+                        socket.close();
+                        System.out.println("Received RST packet, closing conneciton.");
                     }
                 }
             } catch (CorruptedPacketException e) {
@@ -599,8 +639,15 @@ class FirmwareUploader implements SocketHandler {
                     packet = new DatagramPacket(new byte[9], 9);
                     socket.receive(packet);
                     KarelPacket receivedKarelPacket = KarelPacket.parseFromDatagramPacket(packet);
+
+                    if (!receivedKarelPacket.getId().equals(connectionId)) {
+                        continue;
+                    }
+
                     if (receivedKarelPacket.getFlag().isFinishing()) {
                         parent.finReceived = true;
+                    } else if (receivedKarelPacket.getFlag().isCancel()) {
+                        parent.rstReceived = true;
                     }
                 }
             } catch (CorruptedPacketException e) {
@@ -616,9 +663,11 @@ class FirmwareUploader implements SocketHandler {
         // Send init packet
         karelPacket = KarelPacket.createOpeningPacket(PacketData.createFirmwareCommand());
         packet = karelPacket.createDatagramPacket(address, port);
-        socket.send(packet);
-        if (Robot.verbose) {
-            System.out.println("SEND(init): " + karelPacket.toString());
+        if (!socket.isClosed()) {
+            socket.send(packet);
+            if (Robot.verbose) {
+                System.out.println("SEND(init): " + karelPacket.toString());
+            }
         }
     }
 
