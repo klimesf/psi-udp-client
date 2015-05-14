@@ -393,6 +393,7 @@ class FirmwareUploader implements SocketHandler {
     private Map<Integer, Integer> timesSentMap = new HashMap<>();
     private boolean finReceived = false;
     private boolean rstReceived = false;
+    private boolean uploadFinished = false;
 
     public FirmwareUploader(DatagramSocket socket, InetAddress address, int port, String firmwareFileName) throws IOException {
         this.socket = socket;
@@ -431,7 +432,7 @@ class FirmwareUploader implements SocketHandler {
                 futureResult.cancel(true);
             }
 
-            if (toSend.getData().getLength() < 255 && pointer == toSend.getSq().toInteger()) {
+            if (uploadFinished || (toSend.getData().getLength() < 255 && pointer == toSend.getSq().toInteger())) {
                 int finPacketSentTimes = 0;
                 while (!socket.isClosed() && !finReceived && finPacketSentTimes < 21 && !rstReceived) {
                     ExecutorService executorService2 = Executors.newSingleThreadExecutor();
@@ -439,6 +440,8 @@ class FirmwareUploader implements SocketHandler {
                     finPacketSentTimes++;
                     if (!this.socket.isClosed()) {
                         this.sendFinishingPacket();
+                    } else {
+                        System.out.println("Could not send FIN packet, socket is closed.");
                     }
                     try {
                         futureResult2.get(100, TimeUnit.MILLISECONDS);
@@ -450,7 +453,7 @@ class FirmwareUploader implements SocketHandler {
                     }
                     executorService2.shutdown();
                 }
-                System.out.printf("Closing socket because finReceived:%b or rstReceived:%b or finPacketSentTimes:%d\n", finReceived, rstReceived, finPacketSentTimes);
+                System.out.printf("Closing socket because finReceived:%b or rstReceived:%b or uploadFinished:%b or finPacketSentTimes:%d\n", finReceived, rstReceived, uploadFinished, finPacketSentTimes);
                 System.out.printf("Total bytes: %d", totalBytes);
                 this.socket.close();
             }
@@ -460,7 +463,7 @@ class FirmwareUploader implements SocketHandler {
     }
 
     private KarelPacket sendFinishingPacket() throws IOException {
-        KarelPacket toSend = KarelPacket.createFinishingPacket(connectionId, pointer);
+        KarelPacket toSend = KarelPacket.createFinishingPacket(connectionId, pointer + 195);
         DatagramPacket packet = toSend.createDatagramPacket(address, port);
         socket.send(packet);
         if (Robot.verbose) {
@@ -486,17 +489,22 @@ class FirmwareUploader implements SocketHandler {
             return toSend;
         } else {
             KarelPacket toSend = window.get(pointer);
-            DatagramPacket packet = toSend.createDatagramPacket(address, port);
-            socket.send(packet);
-
-            if (timesSentMap.containsKey(pointer)) {
-                timesSentMap.replace(pointer, timesSent + 1);
+            if (toSend == null) {
+                System.out.println("Finished upload.");
+                this.uploadFinished = true;
             } else {
-                timesSentMap.put(pointer, timesSent + 1);
-            }
+                DatagramPacket packet = toSend.createDatagramPacket(address, port);
+                socket.send(packet);
 
-            if (Robot.verbose) {
-                System.out.println("SEND " + toSend.toString());
+                if (timesSentMap.containsKey(pointer)) {
+                    timesSentMap.replace(pointer, timesSent + 1);
+                } else {
+                    timesSentMap.put(pointer, timesSent + 1);
+                }
+
+                if (Robot.verbose) {
+                    System.out.println("SEND " + toSend.toString());
+                }
             }
 
             return toSend;
@@ -512,23 +520,23 @@ class FirmwareUploader implements SocketHandler {
     }
 
     private void fillWindow(int pointer) throws IOException {
-        int interator = pointer;
+        int iterator = pointer;
         for (int i = 0; i < 8; i++) {
-            if (window.containsKey(interator)) {
+            if (window.containsKey(iterator)) {
                 continue;
             }
-            KarelPacket newPacket = this.createDataPacket(interator);
-            window.put(interator, newPacket);
-            interator = addToIterator(newPacket.getData().getLength(), interator);
+            KarelPacket newPacket = this.createDataPacket(iterator);
+            window.put(iterator, newPacket);
+            iterator = addToIterator(newPacket.getData().getLength(), iterator);
         }
     }
 
     private KarelPacket createDataPacket(int pointer) throws IOException {
         byte[] data = new byte[255];
-        fis.read(data, 0, (fis.available() > 255 ? 255 : fis.available()));
+        int bytesRead = fis.read(data, 0, 255);
         ByteBuffer bf = ByteBuffer.wrap(data);
-        byte[] buf = new byte[fis.available() > 255 ? 255 : fis.available()];
-        for (int i = 0; i < buf.length; i++) {
+        byte[] buf = new byte[bytesRead];
+        for (int i = 0; i < bytesRead; i++) {
             buf[i] = bf.get();
         }
         return KarelPacket.createDataPacket(connectionId, pointer, buf);
